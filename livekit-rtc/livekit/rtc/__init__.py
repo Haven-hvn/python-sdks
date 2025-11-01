@@ -101,6 +101,14 @@ from .data_stream import (
     ByteStreamWriter,
     ByteStreamReader,
 )
+from .recorder import (
+    ParticipantRecorder,
+    RecordingStats,
+    RecordingError,
+    ParticipantNotFoundError,
+    TrackNotFoundError,
+    WebMEncoderNotAvailableError,
+)
 
 __all__ = [
     "ConnectionQuality",
@@ -177,5 +185,11 @@ __all__ = [
     "ByteStreamReader",
     "ByteStreamWriter",
     "AudioProcessingModule",
+    "ParticipantRecorder",
+    "RecordingStats",
+    "RecordingError",
+    "ParticipantNotFoundError",
+    "TrackNotFoundError",
+    "WebMEncoderNotAvailableError",
     "__version__",
 ]
