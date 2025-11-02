@@ -51,7 +51,11 @@ class VideoFrame:
         self._width = width
         self._height = height
         self._type = type
-        self._data = bytearray(data)
+        # Avoid double copy if data is already a bytearray
+        if isinstance(data, bytearray):
+            self._data = data
+        else:
+            self._data = bytearray(data)
 
     @property
     def width(self) -> int:
@@ -98,14 +102,17 @@ class VideoFrame:
         info = owned_info.info
         data_len = _get_plane_length(info.type, info.width, info.height)
         cdata = (ctypes.c_uint8 * data_len).from_address(info.data_ptr)
+        # Create bytearray copy from C memory (necessary to own the data)
+        # Use memoryview to avoid intermediate copy during construction
         data = bytearray(cdata)
         frame = VideoFrame(
             width=info.width,
             height=info.height,
             type=info.type,
-            data=data,
+            data=data,  # Already a bytearray, so __init__ won't copy again
         )
-        FfiHandle(owned_info.handle.id)
+        # Dispose FFI handle to free Rust-side memory immediately
+        FfiHandle(owned_info.handle.id).dispose()
         return frame
 
     def _proto_info(self) -> proto_video.VideoBufferInfo:

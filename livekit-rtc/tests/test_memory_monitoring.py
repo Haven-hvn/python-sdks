@@ -13,6 +13,8 @@ import tempfile
 import logging
 import json
 import subprocess
+import gc
+import tracemalloc
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, asdict
@@ -69,6 +71,11 @@ class MemorySnapshot:
     video_frames: int
     audio_frames: int
     recording_duration: float
+    # Profiling data
+    tracemalloc_current_mb: Optional[float] = None
+    tracemalloc_peak_mb: Optional[float] = None
+    top_allocations: Optional[List[Dict[str, Any]]] = None
+    object_counts: Optional[Dict[str, int]] = None
 
 
 def get_memory_usage_system(pid: int) -> Dict[str, float]:
@@ -157,6 +164,59 @@ def get_memory_usage(process_or_pid) -> Dict[str, float]:
         return get_memory_usage_system(pid)
 
 
+def get_tracemalloc_stats() -> Dict[str, Any]:
+    """Get tracemalloc statistics if tracing is active."""
+    if not tracemalloc.is_tracing():
+        return {}
+    
+    try:
+        current, peak = tracemalloc.get_traced_memory()
+        current_mb = current / 1024 / 1024
+        peak_mb = peak / 1024 / 1024
+        
+        # Get top 10 allocations by size
+        snapshot = tracemalloc.take_snapshot()
+        top_stats = snapshot.statistics('lineno')
+        
+        top_allocations = []
+        for index, stat in enumerate(top_stats[:10], 1):
+            top_allocations.append({
+                "rank": index,
+                "size_mb": stat.size / 1024 / 1024,
+                "count": stat.count,
+                "filename": stat.traceback[0].filename if stat.traceback else "unknown",
+                "lineno": stat.traceback[0].lineno if stat.traceback else 0,
+            })
+        
+        return {
+            "current_mb": current_mb,
+            "peak_mb": peak_mb,
+            "top_allocations": top_allocations,
+        }
+    except Exception as e:
+        logger.warning(f"Error getting tracemalloc stats: {e}")
+        return {}
+
+
+def get_object_counts() -> Dict[str, int]:
+    """Count objects by type in memory."""
+    try:
+        gc.collect()  # Force collection before counting
+        objects = gc.get_objects()
+        
+        type_counts: Dict[str, int] = {}
+        for obj in objects:
+            obj_type = type(obj).__name__
+            type_counts[obj_type] = type_counts.get(obj_type, 0) + 1
+        
+        # Sort by count and return top 20
+        sorted_counts = sorted(type_counts.items(), key=lambda x: x[1], reverse=True)[:20]
+        return dict(sorted_counts)
+    except Exception as e:
+        logger.warning(f"Error counting objects: {e}")
+        return {}
+
+
 async def monitor_memory(
     process_or_pid: Any,
     recorder: ParticipantRecorder,
@@ -164,6 +224,7 @@ async def monitor_memory(
     duration_seconds: float,
     interval_seconds: float = 60.0,
     snapshots: List[MemorySnapshot] = None,
+    enable_profiling: bool = True,
 ) -> List[MemorySnapshot]:
     """Monitor memory usage at regular intervals during recording."""
     if snapshots is None:
@@ -172,6 +233,11 @@ async def monitor_memory(
     # Take initial snapshot at start
     memory_info = get_memory_usage(process_or_pid)
     stats = recorder.get_stats()
+    
+    # Get profiling data if enabled
+    tracemalloc_stats = get_tracemalloc_stats() if enable_profiling else {}
+    object_counts = get_object_counts() if enable_profiling else {}
+    
     initial_snapshot = MemorySnapshot(
         timestamp=start_time,
         elapsed_seconds=0.0,
@@ -182,12 +248,20 @@ async def monitor_memory(
         video_frames=stats.video_frames_recorded,
         audio_frames=stats.audio_frames_recorded,
         recording_duration=stats.recording_duration_seconds,
+        tracemalloc_current_mb=tracemalloc_stats.get("current_mb"),
+        tracemalloc_peak_mb=tracemalloc_stats.get("peak_mb"),
+        top_allocations=tracemalloc_stats.get("top_allocations"),
+        object_counts=object_counts,
     )
     snapshots.append(initial_snapshot)
-    logger.info(
+    
+    log_msg = (
         f"[0.0s] Initial Memory: RSS={initial_snapshot.rss_mb:.1f}MB, "
         f"VMS={initial_snapshot.vms_mb:.1f}MB, Percent={initial_snapshot.percent:.1f}%"
     )
+    if enable_profiling and tracemalloc_stats:
+        log_msg += f", Traced: {tracemalloc_stats.get('current_mb', 0):.1f}MB"
+    logger.info(log_msg)
     
     elapsed = 0.0
     check_count = 0
@@ -203,6 +277,10 @@ async def monitor_memory(
         memory_info = get_memory_usage(process_or_pid)
         stats = recorder.get_stats()
         
+        # Get profiling data if enabled
+        tracemalloc_stats = get_tracemalloc_stats() if enable_profiling else {}
+        object_counts = get_object_counts() if enable_profiling else {}
+        
         snapshot = MemorySnapshot(
             timestamp=time.time(),
             elapsed_seconds=elapsed,
@@ -213,14 +291,36 @@ async def monitor_memory(
             video_frames=stats.video_frames_recorded,
             audio_frames=stats.audio_frames_recorded,
             recording_duration=stats.recording_duration_seconds,
+            tracemalloc_current_mb=tracemalloc_stats.get("current_mb"),
+            tracemalloc_peak_mb=tracemalloc_stats.get("peak_mb"),
+            top_allocations=tracemalloc_stats.get("top_allocations"),
+            object_counts=object_counts,
         )
         snapshots.append(snapshot)
         
-        logger.info(
+        log_msg = (
             f"[{elapsed:.1f}s] Memory: RSS={snapshot.rss_mb:.1f}MB, "
             f"VMS={snapshot.vms_mb:.1f}MB, Percent={snapshot.percent:.1f}%, "
             f"Frames: {snapshot.video_frames} video, {snapshot.audio_frames} audio"
         )
+        if enable_profiling and tracemalloc_stats:
+            log_msg += f", Traced: {tracemalloc_stats.get('current_mb', 0):.1f}MB"
+        logger.info(log_msg)
+        
+        # Log top allocations periodically (every 5 minutes)
+        if enable_profiling and check_count % 5 == 0 and tracemalloc_stats.get("top_allocations"):
+            logger.info("  Top 5 allocations:")
+            for alloc in tracemalloc_stats["top_allocations"][:5]:
+                logger.info(
+                    f"    {alloc['filename']}:{alloc['lineno']} - "
+                    f"{alloc['size_mb']:.2f}MB ({alloc['count']} allocations)"
+                )
+        
+        # Log top object types periodically (every 5 minutes)
+        if enable_profiling and check_count % 5 == 0 and object_counts:
+            logger.info("  Top 5 object types:")
+            for obj_type, count in list(object_counts.items())[:5]:
+                logger.info(f"    {obj_type}: {count:,} objects")
     
     return snapshots
 
@@ -278,6 +378,14 @@ async def run_memory_test(
     logger.info("=" * 80)
     logger.info(f"Duration: {duration_minutes} minutes ({duration_seconds} seconds)")
     logger.info(f"Monitoring interval: {monitoring_interval_seconds} seconds")
+    
+    # Enable profiling
+    enable_profiling = os.getenv("LIVEKIT_ENABLE_PROFILING", "true").lower() == "true"
+    if enable_profiling:
+        tracemalloc.start()
+        logger.info("Memory profiling enabled (tracemalloc + object counting)")
+    else:
+        logger.info("Memory profiling disabled")
     logger.info("=" * 80)
     
     # Get current process ID
@@ -378,6 +486,7 @@ async def run_memory_test(
                 duration_seconds,
                 monitoring_interval_seconds,
                 snapshots,
+                enable_profiling=enable_profiling,
             )
         )
         
@@ -404,6 +513,19 @@ async def run_memory_test(
         results["output_file"] = output_file
         results["output_file_size_bytes"] = os.path.getsize(output_file) if os.path.exists(output_file) else 0
         
+        # Get final profiling snapshot
+        if enable_profiling:
+            final_tracemalloc_stats = get_tracemalloc_stats()
+            final_object_counts = get_object_counts()
+            results["final_tracemalloc_stats"] = final_tracemalloc_stats
+            results["final_object_counts"] = final_object_counts
+            
+            if final_tracemalloc_stats:
+                logger.info(
+                    f"Final tracemalloc: {final_tracemalloc_stats.get('current_mb', 0):.1f}MB "
+                    f"(peak: {final_tracemalloc_stats.get('peak_mb', 0):.1f}MB)"
+                )
+        
         # Analyze memory usage
         results["snapshots"] = [asdict(s) for s in snapshots]
         results["memory_analysis"] = analyze_memory_usage(snapshots)
@@ -416,6 +538,9 @@ async def run_memory_test(
         results["success"] = False
     
     finally:
+        if enable_profiling and tracemalloc.is_tracing():
+            tracemalloc.stop()
+        
         if recorder:
             try:
                 await recorder.stop_recording()
@@ -493,6 +618,30 @@ def print_memory_report(results: Dict[str, Any]) -> None:
     print(f"  Audio frames: {stats.get('audio_frames_recorded', 0):,}")
     print(f"  File size: {results.get('output_file_size_bytes', 0):,} bytes")
     print(f"  Output file: {results.get('output_file', 'N/A')}")
+    
+    # Print profiling results if available
+    if results.get("final_tracemalloc_stats"):
+        print("\n" + "=" * 80)
+        print("Memory Profiling Results")
+        print("=" * 80)
+        
+        tracemalloc_stats = results["final_tracemalloc_stats"]
+        print(f"\nTracemalloc Statistics:")
+        print(f"  Current traced: {tracemalloc_stats.get('current_mb', 0):.1f} MB")
+        print(f"  Peak traced: {tracemalloc_stats.get('peak_mb', 0):.1f} MB")
+        
+        if tracemalloc_stats.get("top_allocations"):
+            print(f"\n  Top 10 Allocations by Size:")
+            for alloc in tracemalloc_stats["top_allocations"]:
+                print(
+                    f"    {alloc['rank']}. {alloc['filename']}:{alloc['lineno']} - "
+                    f"{alloc['size_mb']:.2f} MB ({alloc['count']:,} allocations)"
+                )
+    
+    if results.get("final_object_counts"):
+        print(f"\n  Top 10 Object Types by Count:")
+        for obj_type, count in list(results["final_object_counts"].items())[:10]:
+            print(f"    {obj_type}: {count:,} objects")
     
     print("=" * 80)
 
