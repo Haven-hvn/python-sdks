@@ -589,7 +589,13 @@ async def integration_test_recording() -> dict[str, Any]:
         logger.info(f"Tracks available - Video: {has_video}, Audio: {has_audio}")
 
         # Create recorder
-        recorder = ParticipantRecorder(room)
+        # Use VP9 with best quality for highest video quality
+        recorder = ParticipantRecorder(
+            room,
+            video_codec="vp9",
+            video_quality="best",
+            auto_bitrate=True,
+        )
         results["recorder_created"] = True
 
         # Start recording with timeout

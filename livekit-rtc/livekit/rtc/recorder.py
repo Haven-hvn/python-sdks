@@ -108,16 +108,25 @@ class ParticipantRecorder:
         video_bitrate: int = 2000000,  # 2 Mbps
         audio_bitrate: int = 128000,  # 128 kbps
         video_fps: int = 30,
+        video_quality: str = "medium",  # "low", "medium", "high", "best"
+        auto_bitrate: bool = True,  # Auto-adjust bitrate based on resolution
     ) -> None:
         """Initialize a ParticipantRecorder instance.
 
         Args:
             room: The LiveKit Room instance connected to the session.
             video_codec: Video codec to use ('vp8' or 'vp9'). Defaults to 'vp8'.
+                VP9 provides better quality at the same bitrate but is slower to encode.
             audio_codec: Audio codec to use. Defaults to 'opus'.
             video_bitrate: Target video bitrate in bits per second. Defaults to 2000000 (2 Mbps).
+                If auto_bitrate is True, this will be adjusted based on resolution.
             audio_bitrate: Target audio bitrate in bits per second. Defaults to 128000 (128 kbps).
             video_fps: Target video frame rate. Defaults to 30.
+            video_quality: Quality preset for encoding ('low', 'medium', 'high', 'best').
+                Higher quality uses slower encoding but produces better results.
+                Defaults to 'medium'.
+            auto_bitrate: If True, automatically adjust bitrate based on resolution.
+                Higher resolutions get higher bitrates. Defaults to True.
 
         Raises:
             WebMEncoderNotAvailableError: If PyAV is not installed.
@@ -129,6 +138,9 @@ class ParticipantRecorder:
 
         if video_codec not in ("vp8", "vp9"):
             raise ValueError("video_codec must be 'vp8' or 'vp9'")
+        
+        if video_quality not in ("low", "medium", "high", "best"):
+            raise ValueError("video_quality must be 'low', 'medium', 'high', or 'best'")
 
         self.room = room
         self.video_codec = video_codec
@@ -136,6 +148,8 @@ class ParticipantRecorder:
         self.video_bitrate = video_bitrate
         self.audio_bitrate = audio_bitrate
         self.video_fps = video_fps
+        self.video_quality = video_quality
+        self.auto_bitrate = auto_bitrate
 
         self._participant_identity: Optional[str] = None
         self._participant: Optional[RemoteParticipant] = None
@@ -475,6 +489,9 @@ class ParticipantRecorder:
                             # Store first frame timestamp as reference for PTS calculation
                             self._first_video_frame_time = frame_event.timestamp_us
                             
+                            # Calculate optimal bitrate if auto_bitrate is enabled
+                            actual_bitrate = self._calculate_bitrate(video_width, video_height)
+                            
                             self._video_stream = self._output_container.add_stream(
                                 self.video_codec,
                                 rate=self.video_fps,
@@ -482,9 +499,11 @@ class ParticipantRecorder:
                             self._video_stream.width = video_width
                             self._video_stream.height = video_height
                             self._video_stream.pix_fmt = "yuv420p"
-                            self._video_stream.options = {
-                                "bitrate": str(self.video_bitrate),
-                            }
+                            
+                            # Build encoding options with quality settings
+                            encoding_options = self._get_video_encoding_options(actual_bitrate)
+                            self._video_stream.options = encoding_options
+                            logger.info(f"Video encoding: {video_width}x{video_height} @ {actual_bitrate/1_000_000:.2f} Mbps, quality={self.video_quality}")
                             # Set time_base for video (1/1000 for milliseconds-based timing)
                             self._video_stream.time_base = Fraction(1, 1000)
                             self._video_stream_initialized = True
@@ -605,14 +624,129 @@ class ParticipantRecorder:
         finally:
             if self._output_container:
                 try:
+                    # Flush the container before closing to ensure all data is written
+                    # This is especially important for VP9 encoding
+                    try:
+                        self._output_container.flush()
+                    except AttributeError:
+                        # flush() might not be available in all PyAV versions
+                        pass
                     self._output_container.close()
-                    logger.debug("Output container closed")
+                    logger.info(f"Output container closed, temp file at: {self._output_file_path}")
                 except Exception as e:
                     logger.error(f"Error closing output container: {e}", exc_info=True)
                 self._output_container = None
             else:
                 if self._output_file_path:
                     logger.debug(f"No container was initialized, temp file remains at: {self._output_file_path}")
+
+    def _calculate_bitrate(self, width: int, height: int) -> int:
+        """Calculate optimal bitrate based on resolution.
+        
+        Args:
+            width: Video width in pixels.
+            height: Video height in pixels.
+            
+        Returns:
+            Optimal bitrate in bits per second.
+        """
+        if not self.auto_bitrate:
+            return self.video_bitrate
+        
+        # Calculate pixels
+        pixels = width * height
+        
+        # Bitrate recommendations based on resolution (bits per second per pixel * fps factor)
+        # These are conservative estimates that work well for VP8/VP9
+        # Adjust multipliers for different quality expectations
+        
+        # Base bitrate per megapixel at 30fps
+        if pixels <= 640 * 480:  # VGA or smaller
+            bitrate_per_megapixel = 2_000_000  # 2 Mbps per MP
+        elif pixels <= 1280 * 720:  # 720p
+            bitrate_per_megapixel = 3_000_000  # 3 Mbps per MP
+        elif pixels <= 1920 * 1080:  # 1080p
+            bitrate_per_megapixel = 5_000_000  # 5 Mbps per MP
+        else:  # 1440p, 4K, etc.
+            bitrate_per_megapixel = 8_000_000  # 8 Mbps per MP
+        
+        # Calculate base bitrate
+        megapixels = pixels / 1_000_000
+        calculated_bitrate = int(megapixels * bitrate_per_megapixel)
+        
+        # Apply quality multiplier
+        quality_multipliers = {
+            "low": 0.7,
+            "medium": 1.0,
+            "high": 1.5,
+            "best": 2.0,
+        }
+        multiplier = quality_multipliers.get(self.video_quality, 1.0)
+        calculated_bitrate = int(calculated_bitrate * multiplier)
+        
+        # Ensure minimum bitrate and use user's base bitrate as minimum
+        min_bitrate = max(self.video_bitrate, 1_000_000)  # At least 1 Mbps
+        return max(calculated_bitrate, min_bitrate)
+    
+    def _get_video_encoding_options(self, bitrate: int) -> dict[str, str]:
+        """Get video encoding options based on codec and quality settings.
+        
+        Args:
+            bitrate: Target bitrate in bits per second.
+            
+        Returns:
+            Dictionary of encoding options for PyAV.
+        """
+        options: dict[str, str] = {
+            "bitrate": str(bitrate),
+        }
+        
+        if self.video_codec == "vp8":
+            # VP8 quality/CPU tradeoff settings
+            # cpu-used: 0-16, lower = better quality but slower
+            cpu_used_map = {
+                "low": "8",      # Fast encoding, lower quality
+                "medium": "4",   # Balanced
+                "high": "2",     # Slower encoding, better quality
+                "best": "0",     # Slowest encoding, best quality
+            }
+            options["cpu-used"] = cpu_used_map.get(self.video_quality, "4")
+            
+            # Deadzone (noise sensitivity): 0-1000, lower = more sensitive to noise
+            # Lower values preserve more detail but may introduce artifacts
+            if self.video_quality in ("high", "best"):
+                options["deadline"] = "goodquality"  # Better quality mode
+                options["deadline_b"] = "600000"  # ~600ms per frame
+            else:
+                options["deadline"] = "realtime"  # Faster encoding
+        
+        elif self.video_codec == "vp9":
+            # VP9 uses CRF (Constant Rate Factor) for quality-based encoding
+            # CRF: 0-63, lower = better quality (0 = lossless, 31 = default, 63 = worst)
+            crf_map = {
+                "low": "45",     # Higher CRF = lower quality, smaller file
+                "medium": "35",  # Default-like
+                "high": "28",    # Better quality
+                "best": "20",    # Very high quality
+            }
+            options["crf"] = crf_map.get(self.video_quality, "35")
+            
+            # CPU usage: 0-8, lower = better quality but slower
+            cpu_used_map = {
+                "low": "5",      # Faster encoding
+                "medium": "3",   # Balanced
+                "high": "1",     # Slower encoding, better quality
+                "best": "0",     # Slowest encoding, best quality
+            }
+            options["cpu-used"] = cpu_used_map.get(self.video_quality, "3")
+            
+            # VP9 row-based multithreading (faster encoding)
+            options["row-mt"] = "1"
+            
+            # For VP9, bitrate is used as max bitrate when CRF is set
+            # The encoder will try to maintain quality while respecting bitrate limits
+        
+        return options
 
     def _encode_video_frame_incremental_sync(self, frame_event: VideoFrameEvent, frame_index: int) -> None:
         """Encode a single video frame incrementally (synchronous)."""
@@ -765,15 +899,35 @@ class ParticipantRecorder:
             # Move temporary file to final location
             import shutil
             import os
+            import time as time_module
+            
+            # Give a small delay to ensure file system writes are complete
+            # This is especially important for large files or slow storage
+            await asyncio.sleep(0.1)
+            
             if self._output_file_path and os.path.exists(self._output_file_path):
                 # Check if container was initialized (file should have content)
                 file_size = os.path.getsize(self._output_file_path)
+                logger.debug(f"Temp file exists: {self._output_file_path}, size: {file_size} bytes, container_initialized: {self._container_was_initialized}")
+                
                 if file_size > 0 or self._container_was_initialized:
+                    # Double-check file size after a brief delay (for file system sync)
+                    time_module.sleep(0.1)
+                    final_size = os.path.getsize(self._output_file_path)
+                    logger.info(f"Moving encoded file: {self._output_file_path} ({final_size} bytes) -> {output_path}")
+                    
                     output_file_obj = Path(output_path).resolve()
                     output_file_obj.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(self._output_file_path, str(output_file_obj))
                     output_file = str(output_file_obj)
-                    logger.info(f"Moved encoded file from {self._output_file_path} to {output_file} (size: {file_size} bytes)")
+                    
+                    # Verify the moved file exists and has content
+                    if os.path.exists(output_file):
+                        moved_size = os.path.getsize(output_file)
+                        logger.info(f"Moved encoded file from {self._output_file_path} to {output_file} (size: {moved_size} bytes)")
+                    else:
+                        logger.error(f"File move failed: {output_file} does not exist after move")
+                        raise RecordingError(f"Failed to move encoded file to {output_file}")
                 else:
                     # Container was never initialized (no frames arrived)
                     logger.warning(f"No frames were encoded. Container was never initialized. Temp file size: {file_size} bytes")
@@ -789,11 +943,32 @@ class ParticipantRecorder:
                     output_file = str(output_file_obj)
             else:
                 # No temp file was created (encoding task might have failed)
-                logger.warning("No output file was created. Encoding may have failed.")
+                logger.error(f"No output file was created. _output_file_path: {self._output_file_path}, container_initialized: {self._container_was_initialized}")
+                if self._output_file_path:
+                    logger.error(f"Temp file path was set but doesn't exist: {self._output_file_path}")
+                    # Check if temp file exists in a different location
+                    import glob
+                    temp_pattern = os.path.join(os.path.dirname(self._output_file_path) if self._output_file_path else "/tmp", "livekit_recording_*.webm")
+                    found_files = glob.glob(temp_pattern)
+                    if found_files:
+                        logger.info(f"Found potential temp files: {found_files}")
+                        # Try using the most recent one
+                        latest_file = max(found_files, key=os.path.getmtime)
+                        file_size = os.path.getsize(latest_file)
+                        if file_size > 0:
+                            logger.info(f"Using found temp file: {latest_file} ({file_size} bytes)")
+                            output_file_obj = Path(output_path).resolve()
+                            output_file_obj.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.move(latest_file, str(output_file_obj))
+                            output_file = str(output_file_obj)
+                            logger.info(f"Moved found temp file to {output_file} (size: {file_size} bytes)")
+                            return output_file
+                
                 output_file_obj = Path(output_path).resolve()
                 output_file_obj.parent.mkdir(parents=True, exist_ok=True)
                 output_file_obj.touch()
                 output_file = str(output_file_obj)
+                logger.warning("Created empty output file as fallback")
 
             # Clean up all references to allow proper resource release
             self._participant_identity = None
@@ -899,9 +1074,10 @@ class ParticipantRecorder:
                 video_stream.width = video_width
                 video_stream.height = video_height
                 video_stream.pix_fmt = "yuv420p"
-                video_stream.options = {
-                    "bitrate": str(self.video_bitrate),
-                }
+                # Calculate optimal bitrate if auto_bitrate is enabled
+                actual_bitrate = self._calculate_bitrate(video_width, video_height)
+                # Build encoding options with quality settings
+                video_stream.options = self._get_video_encoding_options(actual_bitrate)
 
             # Add audio stream
             if audio_frames:
