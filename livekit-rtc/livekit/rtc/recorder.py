@@ -212,6 +212,11 @@ class ParticipantRecorder:
             self._is_recording = True
             self._start_time = time.time()
 
+            # Reset incremental encoding state for new recording
+            self._first_video_frame_time = None
+            self._cumulative_audio_samples = 0
+            self._video_frame_count = 0
+
             # Subscribe to all published tracks
             await self._subscribe_to_participant_tracks(participant)
 
@@ -467,6 +472,9 @@ class ParticipantRecorder:
                             video_width = frame.width
                             video_height = frame.height
                             
+                            # Store first frame timestamp as reference for PTS calculation
+                            self._first_video_frame_time = frame_event.timestamp_us
+                            
                             self._video_stream = self._output_container.add_stream(
                                 self.video_codec,
                                 rate=self.video_fps,
@@ -480,7 +488,7 @@ class ParticipantRecorder:
                             # Set time_base for video (1/1000 for milliseconds-based timing)
                             self._video_stream.time_base = Fraction(1, 1000)
                             self._video_stream_initialized = True
-                            logger.info(f"Initialized video stream: {video_width}x{video_height}")
+                            logger.info(f"Initialized video stream: {video_width}x{video_height}, first timestamp: {self._first_video_frame_time}us")
                         
                         # Encode video frame
                         await self._encode_video_frame_incremental(frame_event, video_frame_count)
@@ -611,8 +619,8 @@ class ParticipantRecorder:
         if not self._video_stream or not self._output_container:
             return
         
-        # Calculate PTS based on frame index and actual frame rate
-        # Use frame index * frame_interval to ensure proper spacing
+        # Calculate PTS based on actual frame timestamps (not frame index)
+        # This ensures correct duration regardless of actual frame rate
         if self._video_stream.time_base:
             time_base_denominator = self._video_stream.time_base.denominator
             time_base_numerator = self._video_stream.time_base.numerator
@@ -620,12 +628,20 @@ class ParticipantRecorder:
             time_base_denominator = 1000
             time_base_numerator = 1
         
-        # Calculate frame interval based on target FPS
-        frame_interval = int(time_base_denominator / (self.video_fps * time_base_numerator))
-        if frame_interval < 1:
-            frame_interval = 1
-        
-        pts = frame_index * frame_interval
+        # Use actual timestamp from frame event to calculate PTS
+        # timestamp_us is in microseconds, convert to PTS units
+        if self._first_video_frame_time is not None:
+            # Calculate time since first frame in seconds
+            time_since_first_sec = (frame_event.timestamp_us - self._first_video_frame_time) / 1_000_000.0
+            # Convert to PTS units: (time_sec * time_base_denominator) / time_base_numerator
+            # Since time_base = 1/1000, PTS = time_ms = time_sec * 1000
+            pts = int(time_since_first_sec * time_base_denominator / time_base_numerator)
+        else:
+            # Fallback to frame index if first timestamp not set (shouldn't happen)
+            frame_interval = int(time_base_denominator / (self.video_fps * time_base_numerator))
+            if frame_interval < 1:
+                frame_interval = 1
+            pts = frame_index * frame_interval
         
         # Convert and encode frame
         frame = frame_event.frame
