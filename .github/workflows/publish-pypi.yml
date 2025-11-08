@@ -33,4 +33,4 @@ jobs:
       - name: Publish to PyPI via Trusted Publishing
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          package-dir: ./livekit-rtc/dist
+          packages-dir: ./livekit-rtc/dist
