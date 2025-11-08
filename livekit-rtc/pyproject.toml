@@ -6,6 +6,18 @@ requires = [
 ]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "havenplayer-sdk"
+version = "0.1.0"
+description = "Forked LiveKit RTC SDK for Haven Player"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = ["requests"]
+
+[tool.setuptools.packages.find]
+include = ["livekit", "livekit.*"]
+
 [tool.cibuildwheel]
 build = "cp39-*"
 skip = "*-musllinux_*" # not supported (libwebrtc is using glibc)
