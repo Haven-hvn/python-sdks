@@ -26,7 +26,9 @@ jobs:
           pip install build
 
       - name: Build package
-        run: python -m build
+        run: |
+          cd livekit-rtc
+          python -m build
 
       - name: Publish to PyPI via Trusted Publishing
         uses: pypa/gh-action-pypi-publish@release/v1
