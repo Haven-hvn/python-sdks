@@ -27,12 +27,6 @@ with open(os.path.join(here, "livekit", "rtc", "version.py"), "r") as f:
     exec(f.read(), about)
 
 
-class bdist_wheel(_bdist_wheel):
-    def finalize_options(self):
-        self.plat_name = get_platform()  # force a platform tag
-        _bdist_wheel.finalize_options(self)
-
-
 setuptools.setup(
     name="livekit",
     version=about["__version__"],
@@ -40,9 +34,6 @@ setuptools.setup(
     long_description=(here / "README.md").read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
     url="https://github.com/livekit/python-sdks",
-    cmdclass={
-        "bdist_wheel": bdist_wheel,
-    },
     classifiers=[
         "Intended Audience :: Developers",
         "License :: OSI Approved :: Apache Software License",
