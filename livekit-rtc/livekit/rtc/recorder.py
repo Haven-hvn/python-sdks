@@ -254,10 +254,36 @@ class ParticipantRecorder:
         for publication in participant.track_publications.values():
             if not publication.subscribed:
                 publication.set_subscribed(True)
+                self._subscribed_track_sids.add(publication.sid)
                 logger.debug(
                     f"Subscribed to track {publication.sid} "
                     f"(kind: {publication.kind})"
                 )
+
+    async def _unsubscribe_from_participant_tracks(
+        self, participant: Optional[RemoteParticipant]
+    ) -> None:
+        """Unsubscribe from all tracks that were subscribed by this recorder.
+        
+        This method only unsubscribes from tracks that this recorder subscribed to,
+        to avoid interfering with other subscriptions that may exist.
+        """
+        if not participant:
+            return
+        
+        for publication in participant.track_publications.values():
+            # Only unsubscribe if we subscribed to this track
+            if publication.sid in self._subscribed_track_sids and publication.subscribed:
+                try:
+                    publication.set_subscribed(False)
+                    logger.debug(
+                        f"Unsubscribed from track {publication.sid} "
+                        f"(kind: {publication.kind})"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Error unsubscribing from track {publication.sid}: {e}"
+                    )
 
     def _setup_track_handlers(self, participant: RemoteParticipant) -> None:
         """Set up event handlers for track publication events."""
@@ -887,6 +913,12 @@ class ParticipantRecorder:
                 except asyncio.CancelledError:
                     pass
                 self._audio_capture_stream = None
+
+            # Unsubscribe from tracks to stop network activity
+            # This must be done before waiting for encoding to complete
+            # to ensure the server stops sending data immediately
+            if self._participant:
+                await self._unsubscribe_from_participant_tracks(self._participant)
 
             # Wait for encoding task to complete and flush/close
             if self._encoding_task:
