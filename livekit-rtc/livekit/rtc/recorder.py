@@ -874,6 +874,16 @@ class ParticipantRecorder:
             if not self._is_recording:
                 raise RecordingError("Recording is not in progress")
 
+            logger.info("Stopping recording... starting graceful drain.")
+
+            # 1. Unsubscribe FIRST to stop new data from server
+            if self._participant:
+                await self._unsubscribe_from_participant_tracks(self._participant)
+
+            # 2. Wait for buffers to drain (keep _is_recording=True during this time)
+            # This allows the capture loops to pick up the final frames
+            await asyncio.sleep(1.0)
+
             self._is_recording = False
 
             # Update statistics
@@ -913,12 +923,6 @@ class ParticipantRecorder:
                 except asyncio.CancelledError:
                     pass
                 self._audio_capture_stream = None
-
-            # Unsubscribe from tracks to stop network activity
-            # This must be done before waiting for encoding to complete
-            # to ensure the server stops sending data immediately
-            if self._participant:
-                await self._unsubscribe_from_participant_tracks(self._participant)
 
             # Wait for encoding task to complete and flush/close
             if self._encoding_task:
