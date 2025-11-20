@@ -469,6 +469,19 @@ class ParticipantRecorder:
                 frames_processed = False
                 logger.debug("Video frame processing task started")
                 while self._is_recording or not self._video_queue.empty():
+                    # [NEW] Debug log every 50 frames
+                    if video_frame_count % 50 == 0:
+                        try:
+                            import psutil, os
+                            process = psutil.Process(os.getpid())
+                            mem = process.memory_info().rss / 1024 / 1024
+                            logger.debug(
+                                f"🎥 Video Loop | Frame: {video_frame_count} | "
+                                f"Queue: {self._video_queue.qsize()} | Mem: {mem:.1f}MB"
+                            )
+                        except ImportError:
+                            pass
+
                     try:
                         # Wait for frame with timeout to check recording status periodically
                         if self._is_recording:
@@ -512,28 +525,39 @@ class ParticipantRecorder:
                             video_width = frame.width
                             video_height = frame.height
                             
+                            # [NEW] Log exact parameters before stream creation
+                            logger.info(
+                                f"Attempting to add_stream: codec={self.video_codec}, "
+                                f"rate={self.video_fps}, width={video_width}, height={video_height}, "
+                                f"auto_bitrate={self.auto_bitrate}"
+                            )
+                            
                             # Store first frame timestamp as reference for PTS calculation
                             self._first_video_frame_time = frame_event.timestamp_us
                             
                             # Calculate optimal bitrate if auto_bitrate is enabled
                             actual_bitrate = self._calculate_bitrate(video_width, video_height)
                             
-                            self._video_stream = self._output_container.add_stream(
-                                self.video_codec,
-                                rate=self.video_fps,
-                            )
-                            self._video_stream.width = video_width
-                            self._video_stream.height = video_height
-                            self._video_stream.pix_fmt = "yuv420p"
-                            
-                            # Build encoding options with quality settings
-                            encoding_options = self._get_video_encoding_options(actual_bitrate)
-                            self._video_stream.options = encoding_options
-                            logger.info(f"Video encoding: {video_width}x{video_height} @ {actual_bitrate/1_000_000:.2f} Mbps, quality={self.video_quality}")
-                            # Set time_base for video (1/1000 for milliseconds-based timing)
-                            self._video_stream.time_base = Fraction(1, 1000)
-                            self._video_stream_initialized = True
-                            logger.info(f"Initialized video stream: {video_width}x{video_height}, first timestamp: {self._first_video_frame_time}us")
+                            try:
+                                self._video_stream = self._output_container.add_stream(
+                                    self.video_codec,
+                                    rate=self.video_fps,
+                                )
+                                self._video_stream.width = video_width
+                                self._video_stream.height = video_height
+                                self._video_stream.pix_fmt = "yuv420p"
+                                
+                                # Build encoding options with quality settings
+                                encoding_options = self._get_video_encoding_options(actual_bitrate)
+                                self._video_stream.options = encoding_options
+                                logger.info(f"Video encoding: {video_width}x{video_height} @ {actual_bitrate/1_000_000:.2f} Mbps, quality={self.video_quality}")
+                                # Set time_base for video (1/1000 for milliseconds-based timing)
+                                self._video_stream.time_base = Fraction(1, 1000)
+                                self._video_stream_initialized = True
+                                logger.info(f"Initialized video stream: {video_width}x{video_height}, first timestamp: {self._first_video_frame_time}us")
+                            except Exception as e:
+                                logger.critical(f"❌ PyAV add_stream failed: {e}")
+                                raise
                         
                         # Encode video frame
                         await self._encode_video_frame_incremental(frame_event, video_frame_count)
@@ -784,6 +808,14 @@ class ParticipantRecorder:
         if self._video_stream.time_base:
             time_base_denominator = self._video_stream.time_base.denominator
             time_base_numerator = self._video_stream.time_base.numerator
+
+            # [NEW] Check for zero values
+            if time_base_numerator == 0 or self.video_fps == 0:
+                logger.critical(
+                    f"❌ Zero value detected! time_base={time_base_numerator}/{time_base_denominator}, fps={self.video_fps}. "
+                    f"This will cause DivByZero crash."
+                )
+                return # Skip this frame safely
         else:
             time_base_denominator = 1000
             time_base_numerator = 1
@@ -1280,6 +1312,11 @@ class ParticipantRecorder:
         if not stream:
             return None
 
+        # [NEW] Validate inputs before PyAV call
+        if frame.width <= 0 or frame.height <= 0:
+            logger.error(f"❌ Invalid frame dimensions: {frame.width}x{frame.height}")
+            return None
+
         try:
             # Convert frame to I420 format if needed
             # This creates a new VideoFrame - the old one will be GC'd after use
@@ -1373,8 +1410,11 @@ class ParticipantRecorder:
             
             return pyav_frame
         except Exception as e:
-            logger.error(f"Error converting video frame: {e}", exc_info=True)
-            return None
+            logger.critical(
+                f"❌ Frame allocation failed: {frame.width}x{frame.height}, "
+                f"PTS: {pts}, Error: {e}"
+            )
+            raise
 
     def _convert_audio_frame_to_pyav(
         self,
@@ -1438,6 +1478,15 @@ class ParticipantRecorder:
             recording_duration_seconds=self._stats.recording_duration_seconds,
             output_file_size_bytes=self._stats.output_file_size_bytes,
         )
+
+    def debug_get_internal_state(self):
+        return {
+            "video_queue_size": self._video_queue.qsize(),
+            "audio_queue_size": self._audio_queue.qsize(),
+            "video_stream_init": self._video_stream_initialized,
+            "frames_processed": self._stats.video_frames_recorded,
+            "last_pts": getattr(self, '_last_processed_pts', None)
+        }
 
     @property
     def is_recording(self) -> bool:
