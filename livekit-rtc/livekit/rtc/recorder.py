@@ -962,21 +962,24 @@ class ParticipantRecorder:
                 f"fps={self.video_fps}, codec={self.video_codec}"
             )
         
-        # Calculate PTS in milliseconds (standard 1/1000 timebase)
-        # This works robustly with the forced 1/1000 stream timebase
-        time_base_denominator = 1000
-        time_base_numerator = 1
+        # Calculate PTS
+        # We use encoder's expected timebase (1/FPS) for PTS calculation to prevent duration inflation
+        # But we track it in 1/FPS units to keep logic clean
+        
+        encoder_fps = self.video_fps if self.video_fps > 0 else 30
+        # time_base_denominator/numerator are no longer used here as we use encoder_fps directly
         
         if self._first_video_frame_time is not None:
             time_since_first_us = frame_event.timestamp_us - self._first_video_frame_time
-            # Convert microseconds to milliseconds (1/1000)
-            pts = int(time_since_first_us / 1000)
+            # Calculate PTS in 1/FPS units (frames)
+            # PTS = (us / 1_000_000) * FPS
+            pts = int((time_since_first_us / 1_000_000.0) * encoder_fps)
             
             # Enforce strictly monotonic increasing timestamps
             if pts <= self._last_video_pts:
                  pts = self._last_video_pts + 1
         else:
-            pts = frame_index * 33  # Fallback assumption of ~30fps (33ms per frame)
+            pts = frame_index  # Simple frame count if no time reference
         
         self._last_video_pts = pts
         
@@ -984,8 +987,8 @@ class ParticipantRecorder:
         frame = frame_event.frame
         pyav_frame = self._convert_video_frame_to_pyav(frame, self._video_stream, pts)
         
-        # Do NOT set pyav_frame.time_base manually. Let PyAV handle it.
-        # Setting it caused black video in previous attempts.
+        # DO NOT set pyav_frame.time_base manually. 
+        # The encoder generally ignores it or uses it only if stream.time_base is not set.
         
         if pyav_frame and self._video_stream:
             # CRITICAL FIX: Ensure packet time_base matches stream time_base
