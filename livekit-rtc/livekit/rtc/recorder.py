@@ -551,6 +551,9 @@ class ParticipantRecorder:
                                 # This simplifies PTS calculation (milliseconds) and ensures compatibility
                                 self._video_stream.time_base = Fraction(1, 1000)
                                 
+                                # Force codec context time_base as well to align encoder
+                                self._video_stream.codec_context.time_base = Fraction(1, 1000)
+                                
                                 if self._video_stream.time_base:
                                     logger.info(f"Stream time_base set to: {self._video_stream.time_base}")
                                 else:
@@ -1003,45 +1006,59 @@ class ParticipantRecorder:
                         packet.duration = int(1 / (self.video_fps * tb_val))
                         logger.debug(f"Frame {frame_index}: Force set duration to {packet.duration} (tb={current_tb})")
 
-                # Fix timebase mismatch that causes 0xc0000094 crash
-                if packet.time_base != self._video_stream.time_base:
-                    logger.info(
-                        f"Frame {frame_index}, Packet {packet_idx}: ⚠️ Timebase mismatch - "
-                        f"packet: {packet.time_base}, stream: {self._video_stream.time_base}"
-                    )
-                    
-                    # Manual conversion since PyAV 16.0.1 might lack rescale() or it failed
-                    try:
-                        if (packet.time_base and self._video_stream.time_base and 
-                            packet.time_base.denominator > 0 and 
-                            self._video_stream.time_base.denominator > 0 and
-                            packet.time_base.numerator > 0 and
-                            self._video_stream.time_base.numerator > 0):
-                            
-                            old_num = packet.time_base.numerator
-                            old_den = packet.time_base.denominator
-                            new_num = self._video_stream.time_base.numerator
-                            new_den = self._video_stream.time_base.denominator
-                            
-                            if packet.pts is not None:
-                                packet.pts = (packet.pts * old_num * new_den) // (old_den * new_num)
-                            
-                            if packet.dts is not None:
-                                packet.dts = (packet.dts * old_num * new_den) // (old_den * new_num)
+                    # Fix timebase mismatch that causes 0xc0000094 crash
+                    if packet.time_base != self._video_stream.time_base:
+                        logger.debug(
+                            f"Frame {frame_index}, Packet {packet_idx}: ⚠️ Timebase mismatch - "
+                            f"packet: {packet.time_base}, stream: {self._video_stream.time_base}"
+                        )
+                        
+                        # Manual conversion since PyAV 16.0.1 might lack rescale() or it failed
+                        try:
+                            if (packet.time_base and self._video_stream.time_base and 
+                                packet.time_base.denominator > 0 and 
+                                self._video_stream.time_base.denominator > 0 and
+                                packet.time_base.numerator > 0 and
+                                self._video_stream.time_base.numerator > 0):
                                 
-                            if packet.duration:
-                                packet.duration = (packet.duration * old_num * new_den) // (old_den * new_num)
+                                old_num = packet.time_base.numerator
+                                old_den = packet.time_base.denominator
+                                new_num = self._video_stream.time_base.numerator
+                                new_den = self._video_stream.time_base.denominator
                                 
-                            packet.time_base = self._video_stream.time_base
-                            logger.debug(f"Frame {frame_index}: Manually converted packet - pts={packet.pts}, dts={packet.dts}, dur={packet.duration}, tb={packet.time_base}")
-                        else:
-                            logger.warning(f"Frame {frame_index}: Invalid timebase for manual conversion")
+                                if packet.pts is not None:
+                                    # Standard rescaling formula: pts * (old_tb / new_tb)
+                                    # Expanded: pts * (old_num / old_den) * (new_den / new_num)
+                                    packet.pts = (packet.pts * old_num * new_den) // (old_den * new_num)
+                                
+                                if packet.dts is not None:
+                                    packet.dts = (packet.dts * old_num * new_den) // (old_den * new_num)
+                                    
+                                if packet.duration:
+                                    packet.duration = (packet.duration * old_num * new_den) // (old_den * new_num)
+                                    
+                                packet.time_base = self._video_stream.time_base
+                                logger.debug(f"Frame {frame_index}: Manually converted packet - pts={packet.pts}, dts={packet.dts}, dur={packet.duration}, tb={packet.time_base}")
+                            else:
+                                logger.warning(f"Frame {frame_index}: Invalid timebase for manual conversion")
 
-                    except Exception as e:
-                        logger.error(f"Frame {frame_index}: Manual conversion failed: {e}")
+                        except Exception as e:
+                            logger.error(f"Frame {frame_index}: Manual conversion failed: {e}")
+                            # Fallback: trust PyAV/FFmpeg to handle it if manual fail
+                            pass
+                    
+                    # CRITICAL: Re-verify duration after any conversion
+                    # If duration became 0 during integer conversion (common for 1/30 -> 1/1000 conversion of small durations)
+                    # we must restore it to at least 1 tick (1ms)
+                    if not packet.duration or packet.duration <= 0:
+                        if self.video_fps > 0:
+                             packet.duration = int(1000 / self.video_fps) # e.g. 33ms for 30fps
+                        else:
+                             packet.duration = 33 # Default to 33ms
+                        logger.debug(f"Frame {frame_index}: Restored duration to {packet.duration} after conversion")
                 
-                # Ensure packet is associated with the correct stream
-                packet.stream = self._video_stream
+                    # Ensure packet is associated with the correct stream
+                    packet.stream = self._video_stream
                 
                 # Log before muxing
                 logger.info(
@@ -1096,55 +1113,56 @@ class ParticipantRecorder:
         pyav_frame = self._convert_audio_frame_to_pyav(frame, self._audio_stream, audio_pts)
         if pyav_frame and self._audio_stream:
             for packet_idx, packet in enumerate(self._audio_stream.encode(pyav_frame)):
-                # Fix timebase mismatch for audio packets too
-                if packet.time_base != self._audio_stream.time_base:
-                    logger.info(
-                        f"Audio Frame, Packet {packet_idx}: ⚠️ Timebase mismatch - "
-                        f"packet: {packet.time_base}, stream: {self._audio_stream.time_base}"
-                    )
-                    
-                    if self._audio_stream.time_base is None:
-                        logger.warning(f"Audio Frame, Packet {packet_idx}: Cannot rescale, stream timebase is None")
-                    else:
-                        try:
-                            # Manual conversion for audio
-                            if (packet.time_base and self._audio_stream.time_base and 
-                                packet.time_base.denominator > 0 and 
-                                self._audio_stream.time_base.denominator > 0 and
-                                packet.time_base.numerator > 0 and
-                                self._audio_stream.time_base.numerator > 0):
-                                
-                                old_num = packet.time_base.numerator
-                                old_den = packet.time_base.denominator
-                                new_num = self._audio_stream.time_base.numerator
-                                new_den = self._audio_stream.time_base.denominator
-                                
-                                if packet.pts is not None:
-                                    packet.pts = (packet.pts * old_num * new_den) // (old_den * new_num)
-                                
-                                if packet.dts is not None:
-                                    packet.dts = (packet.dts * old_num * new_den) // (old_den * new_num)
+                    # Fix timebase mismatch for audio packets too
+                    if packet.time_base != self._audio_stream.time_base:
+                        logger.debug(
+                            f"Audio Frame, Packet {packet_idx}: ⚠️ Timebase mismatch - "
+                            f"packet: {packet.time_base}, stream: {self._audio_stream.time_base}"
+                        )
+                        
+                        if self._audio_stream.time_base is None:
+                            logger.warning(f"Audio Frame, Packet {packet_idx}: Cannot rescale, stream timebase is None")
+                        else:
+                            try:
+                                # Manual conversion for audio
+                                if (packet.time_base and self._audio_stream.time_base and 
+                                    packet.time_base.denominator > 0 and 
+                                    self._audio_stream.time_base.denominator > 0 and
+                                    packet.time_base.numerator > 0 and
+                                    self._audio_stream.time_base.numerator > 0):
                                     
-                                if packet.duration:
-                                    packet.duration = (packet.duration * old_num * new_den) // (old_den * new_num)
+                                    old_num = packet.time_base.numerator
+                                    old_den = packet.time_base.denominator
+                                    new_num = self._audio_stream.time_base.numerator
+                                    new_den = self._audio_stream.time_base.denominator
                                     
-                                packet.time_base = self._audio_stream.time_base
-                                logger.debug(f"Audio Frame, Packet {packet_idx}: Manually converted packet - pts={packet.pts}, dts={packet.dts}, dur={packet.duration}, tb={packet.time_base}")
-                            else:
-                                logger.warning(f"Audio Frame, Packet {packet_idx}: Invalid timebase for manual conversion")
-                        except Exception as e:
-                            logger.error(f"Audio Frame, Packet {packet_idx}: Manual conversion failed: {e}")
+                                    if packet.pts is not None:
+                                        packet.pts = (packet.pts * old_num * new_den) // (old_den * new_num)
+                                    
+                                    if packet.dts is not None:
+                                        packet.dts = (packet.dts * old_num * new_den) // (old_den * new_num)
+                                        
+                                    if packet.duration:
+                                        packet.duration = (packet.duration * old_num * new_den) // (old_den * new_num)
+                                        
+                                    packet.time_base = self._audio_stream.time_base
+                                    logger.debug(f"Audio Frame, Packet {packet_idx}: Manually converted packet - pts={packet.pts}, dts={packet.dts}, dur={packet.duration}, tb={packet.time_base}")
+                                else:
+                                    logger.warning(f"Audio Frame, Packet {packet_idx}: Invalid timebase for manual conversion")
+                            except Exception as e:
+                                logger.error(f"Audio Frame, Packet {packet_idx}: Manual conversion failed: {e}")
+                                pass
 
-                # Ensure packet is associated with the correct stream
-                packet.stream = self._audio_stream
+                    # Ensure packet is associated with the correct stream
+                    packet.stream = self._audio_stream
                 
-                try:
-                    self._output_container.mux(packet)
-                except Exception as e:
-                    logger.critical(
-                        f"Audio mux failed: {e} - pts={packet.pts}, dts={packet.dts}, tb={packet.time_base}"
-                    )
-                    raise
+                    try:
+                        self._output_container.mux(packet)
+                    except Exception as e:
+                        logger.critical(
+                            f"Audio mux failed: {e} - pts={packet.pts}, dts={packet.dts}, tb={packet.time_base}"
+                        )
+                        raise
             
             # Update cumulative samples for next frame
             self._cumulative_audio_samples += samples_per_channel
