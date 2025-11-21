@@ -1098,14 +1098,39 @@ class ParticipantRecorder:
                     f"packet_tb={packet.time_base}, stream_tb={self._video_stream.time_base}"
                 )
                 
-                # Force set duration if missing (CRITICAL for 0xc0000094 prevention)
-                if not packet.duration and self.video_fps > 0:
-                    # Use packet's current timebase to calculate duration
-                    current_tb = packet.time_base or self._video_stream.time_base
-                    if current_tb and current_tb.numerator > 0:
-                        tb_val = current_tb.numerator / current_tb.denominator
-                        packet.duration = int(1 / (self.video_fps * tb_val))
-                        logger.debug(f"Frame {frame_index}: Force set duration to {packet.duration} (tb={current_tb})")
+                # Ensure packet timebase matches stream timebase
+                target_time_base = self._video_stream.time_base or Fraction(1, 1000)
+                
+                # Capture old timebase
+                old_time_base = packet.time_base
+                
+                # Overwrite timebase to match our calculated PTS units
+                packet.time_base = target_time_base
+                packet.pts = pts
+                packet.dts = pts
+                
+                # Recalculate duration
+                if packet.duration and old_time_base and target_time_base:
+                    try:
+                        num = int(packet.duration * old_time_base.numerator * target_time_base.denominator)
+                        den = int(old_time_base.denominator * target_time_base.numerator)
+                        if den > 0:
+                            packet.duration = num // den
+                    except Exception:
+                        packet.duration = 0 
+
+                # Force set duration if missing or zero
+                if not packet.duration or packet.duration <= 0:
+                    if self.video_fps > 0:
+                        if target_time_base.numerator > 0:
+                            tb_val = target_time_base.numerator / target_time_base.denominator
+                            packet.duration = int(1 / (self.video_fps * tb_val))
+                    else:
+                        if target_time_base.denominator == 1000:
+                             packet.duration = 33
+                        else:
+                             packet.duration = 1
+                    logger.debug(f"Frame {frame_index}: Force set duration to {packet.duration} (tb={target_time_base})")
 
                     # Fix timebase mismatch that causes 0xc0000094 crash
                     target_time_base = self._video_stream.time_base or Fraction(1, 1000)
