@@ -393,21 +393,32 @@ class ParticipantRecorder:
         try:
             first_frame = True
             frame_count = 0
+            
+            # Log that we are entering the loop
+            logger.info(f"Video capture loop running for participant {self._participant_identity}")
+            
             async for frame_event in self._video_capture_stream:
                 if not self._is_recording:
                     logger.debug(f"Recording stopped, breaking video capture loop. Captured {frame_count} frames")
                     break
                 # Store first frame timestamp as reference for synchronization
-                if first_frame and self._start_time:
-                    # Convert start_time (seconds) to microseconds for consistency
-                    self._recording_start_time_us = int(self._start_time * 1_000_000)
+                if first_frame:
+                    if self._start_time:
+                        # Convert start_time (seconds) to microseconds for consistency
+                        self._recording_start_time_us = int(self._start_time * 1_000_000)
                     first_frame = False
                     logger.debug(f"Captured first video frame. Queue size before put: {self._video_queue.qsize()}")
                 
                 # Put frame in queue, waiting if necessary
                 # The bounded queue size limits memory growth while allowing backpressure
                 # We store capture time to ensure PTS matches wall clock time
-                await self._video_queue.put((frame_event, time.time()))
+                try:
+                    # Use timeout to detect if consumer is stuck
+                    await asyncio.wait_for(self._video_queue.put((frame_event, time.time())), timeout=1.0)
+                except asyncio.TimeoutError:
+                     logger.warning(f"Video queue full/blocked for 1.0s! Dropping frame {frame_count}. Consumer might be stuck.")
+                     continue
+                
                 frame_count += 1
                 self._stats.video_frames_recorded += 1
                 if frame_count % 100 == 0:
@@ -429,6 +440,10 @@ class ParticipantRecorder:
         try:
             first_frame = True
             frame_count = 0
+            
+            # Log that we are entering the loop
+            logger.info(f"Audio capture loop running for participant {self._participant_identity}")
+            
             async for frame_event in self._audio_capture_stream:
                 if not self._is_recording:
                     logger.debug(f"Recording stopped, breaking audio capture loop. Captured {frame_count} frames")
@@ -440,7 +455,13 @@ class ParticipantRecorder:
                 
                 # Put frame in queue, waiting if necessary
                 # The bounded queue size limits memory growth while allowing backpressure
-                await self._audio_queue.put((frame_event, time.time()))
+                try:
+                     # Use timeout to detect if consumer is stuck
+                    await asyncio.wait_for(self._audio_queue.put((frame_event, time.time())), timeout=1.0)
+                except asyncio.TimeoutError:
+                     logger.warning(f"Audio queue full/blocked for 1.0s! Dropping frame {frame_count}. Consumer might be stuck.")
+                     continue
+                     
                 frame_count += 1
                 self._stats.audio_frames_recorded += 1
                 if frame_count % 500 == 0:
@@ -1024,6 +1045,19 @@ class ParticipantRecorder:
                     logger.debug(f"Frame {frame_index}: Time drift - Wall: {time_since_start_s:.3f}s, SDK: {sdk_duration:.3f}s, Drift: {drift:.3f}s")
 
             # Enforce strictly monotonic increasing timestamps
+            # Handle large gaps (e.g. from stale state) by resetting
+            if self._last_video_pts != -1:
+                # If PTS jumps backwards significantly or jumps forwards massively (30s+), reset
+                # This prevents stale last_pts from inflating current timestamps
+                pts_diff = pts - self._last_video_pts
+                
+                # 30 seconds in stream timebase units
+                threshold = 30 * time_base_denominator // time_base_numerator
+                
+                if pts_diff < -threshold or pts_diff > threshold:
+                    logger.warning(f"Frame {frame_index}: Large video PTS gap detected ({self._last_video_pts} -> {pts}). Resetting monotonicity.")
+                    self._last_video_pts = pts - 1
+            
             if pts <= self._last_video_pts:
                  pts = self._last_video_pts + 1
         else:
@@ -1127,6 +1161,11 @@ class ParticipantRecorder:
                     f"pts={packet.pts}, dts={packet.dts}, duration={packet.duration}, tb={packet.time_base}"
                 )
                 
+                # Safety check for PTS/DTS overflow/underflow (int64 range)
+                if packet.pts is not None and (packet.pts < -9223372036854775808 or packet.pts > 9223372036854775807):
+                    logger.error(f"Frame {frame_index}: PTS out of int64 range: {packet.pts}. Dropping packet to prevent crash.")
+                    continue
+
                 try:
                     self._output_container.mux(packet)
                     logger.debug(f"Frame {frame_index}, Packet {packet_idx}: ✅ Mux successful")
@@ -1135,7 +1174,8 @@ class ParticipantRecorder:
                         f"Frame {frame_index}, Packet {packet_idx}: ❌ CRITICAL: Mux failed! "
                         f"pts={packet.pts}, dts={packet.dts}, tb={packet.time_base}, error={e}"
                     )
-                    raise
+                    # Don't raise, just drop the packet to keep recording alive
+                    pass
         
         # Release frame reference immediately
         del pyav_frame
@@ -1181,12 +1221,23 @@ class ParticipantRecorder:
             
             # Enforce strictly monotonic increasing timestamps for audio
             # Audio packets must be strictly increasing to prevent muxer errors
+            
+            if self._last_audio_pts != -1:
+                # Handle large gaps (e.g. from stale state) by resetting
+                # 30 seconds in stream timebase units
+                threshold = 30 * time_base_denominator // time_base_numerator
+                pts_diff = audio_pts - self._last_audio_pts
+                
+                if pts_diff < -threshold or pts_diff > threshold:
+                    logger.warning(f"Audio PTS gap detected ({self._last_audio_pts} -> {audio_pts}). Resetting monotonicity.")
+                    self._last_audio_pts = audio_pts - 1
+
             if audio_pts <= self._last_audio_pts:
                 old_pts = audio_pts
                 audio_pts = self._last_audio_pts + 1
                 # Only log if the adjustment is significant (>10ms) to avoid spam on minor jitter
                 if self._last_audio_pts - old_pts > 10 * time_base_denominator / 1000:
-                     logger.warning(f"Audio PTS adjusted for monotonicity: {old_pts} -> {audio_pts} (last={self._last_audio_pts})")
+                     logger.debug(f"Audio PTS adjusted for monotonicity: {old_pts} -> {audio_pts} (last={self._last_audio_pts})")
             
             self._last_audio_pts = audio_pts
         else:
@@ -1240,13 +1291,19 @@ class ParticipantRecorder:
                     # Ensure packet is associated with the correct stream
                     packet.stream = self._audio_stream
                 
+                    # Safety check for PTS/DTS overflow/underflow (int64 range)
+                    if packet.pts is not None and (packet.pts < -9223372036854775808 or packet.pts > 9223372036854775807):
+                        logger.error(f"Audio Frame: PTS out of int64 range: {packet.pts}. Dropping packet.")
+                        continue
+
                     try:
                         self._output_container.mux(packet)
                     except Exception as e:
                         logger.critical(
                             f"Audio mux failed: {e} - pts={packet.pts}, dts={packet.dts}, tb={packet.time_base}"
                         )
-                        raise
+                        # Don't raise, just drop the packet
+                        pass
             
             # Update cumulative samples for next frame
             self._cumulative_audio_samples += samples_per_channel
