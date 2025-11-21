@@ -185,6 +185,7 @@ class ParticipantRecorder:
         self._first_video_frame_time: Optional[float] = None
         self._video_frame_count: int = 0
         self._last_video_pts: int = -1  # For monotonic PTS enforcement
+        self._last_audio_pts: int = -1  # For monotonic PTS enforcement for audio
 
         # Synchronization
         self._lock = asyncio.Lock()
@@ -228,6 +229,20 @@ class ParticipantRecorder:
             self._cumulative_audio_samples = 0
             self._video_frame_count = 0
             self._last_video_pts = -1  # Reset monotonic PTS tracker
+            self._last_audio_pts = -1  # Reset monotonic PTS tracker for audio
+
+            # Clear queues to prevent stale frames from previous sessions
+            while not self._video_queue.empty():
+                try:
+                    self._video_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            
+            while not self._audio_queue.empty():
+                try:
+                    self._audio_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
 
             # Subscribe to all published tracks
             await self._subscribe_to_participant_tracks(participant)
@@ -759,6 +774,12 @@ class ParticipantRecorder:
                         f"packet_tb={packet.time_base}, stream_tb={self._audio_stream.time_base}"
                     )
                     
+                    # Enforce monotonicity for flush packets too
+                    if packet.pts is not None:
+                        if packet.pts <= self._last_audio_pts:
+                            packet.pts = self._last_audio_pts + 1
+                        self._last_audio_pts = packet.pts
+
                     # Same fix for audio packets
                     if packet.time_base != self._audio_stream.time_base:
                         logger.debug(
@@ -1157,6 +1178,17 @@ class ParticipantRecorder:
             
             # Calculate PTS: seconds * (den / num)
             audio_pts = int(time_since_start_s * time_base_denominator / time_base_numerator)
+            
+            # Enforce strictly monotonic increasing timestamps for audio
+            # Audio packets must be strictly increasing to prevent muxer errors
+            if audio_pts <= self._last_audio_pts:
+                old_pts = audio_pts
+                audio_pts = self._last_audio_pts + 1
+                # Only log if the adjustment is significant (>10ms) to avoid spam on minor jitter
+                if self._last_audio_pts - old_pts > 10 * time_base_denominator / 1000:
+                     logger.warning(f"Audio PTS adjusted for monotonicity: {old_pts} -> {audio_pts} (last={self._last_audio_pts})")
+            
+            self._last_audio_pts = audio_pts
         else:
             # Fallback to cumulative samples if no start time (shouldn't happen)
             audio_pts = self._cumulative_audio_samples
