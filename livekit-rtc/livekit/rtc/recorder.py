@@ -166,7 +166,7 @@ class ParticipantRecorder:
         
         # Store (event, capture_time) tuples to track wall-clock arrival time
         self._video_queue: asyncio.Queue[tuple[VideoFrameEvent, float]] = asyncio.Queue(maxsize=max_video_queue_size)
-        self._audio_queue: asyncio.Queue[AudioFrameEvent] = asyncio.Queue(maxsize=max_audio_queue_size)
+        self._audio_queue: asyncio.Queue[tuple[AudioFrameEvent, float]] = asyncio.Queue(maxsize=max_audio_queue_size)
 
         # Background tasks for capturing frames
         self._video_capture_task: Optional[asyncio.Task[None]] = None
@@ -425,7 +425,7 @@ class ParticipantRecorder:
                 
                 # Put frame in queue, waiting if necessary
                 # The bounded queue size limits memory growth while allowing backpressure
-                await self._audio_queue.put(frame_event)
+                await self._audio_queue.put((frame_event, time.time()))
                 frame_count += 1
                 self._stats.audio_frames_recorded += 1
                 if frame_count % 500 == 0:
@@ -595,9 +595,10 @@ class ParticipantRecorder:
                         if self._is_recording:
                             try:
                                 logger.debug(f"Waiting for audio frame. Queue size: {self._audio_queue.qsize()}, Recording: {self._is_recording}")
-                                frame_event = await asyncio.wait_for(
+                                frame_data = await asyncio.wait_for(
                                     self._audio_queue.get(), timeout=0.1
                                 )
+                                frame_event, capture_time = frame_data
                                 frames_processed = True
                                 logger.debug(f"Received audio frame {audio_frame_count + 1}")
                             except asyncio.TimeoutError:
@@ -608,9 +609,10 @@ class ParticipantRecorder:
                             queue_size = self._audio_queue.qsize()
                             logger.debug(f"Recording stopped. Processing remaining audio frames. Queue size: {queue_size}")
                             try:
-                                frame_event = await asyncio.wait_for(
+                                frame_data = await asyncio.wait_for(
                                     self._audio_queue.get(), timeout=1.0
                                 )
+                                frame_event, capture_time = frame_data
                                 frames_processed = True
                                 logger.debug(f"Processed remaining audio frame {audio_frame_count + 1}")
                             except (asyncio.TimeoutError, asyncio.QueueEmpty):
@@ -648,7 +650,7 @@ class ParticipantRecorder:
                             logger.info(f"Initialized audio stream: {frame.sample_rate}Hz, {frame.num_channels}ch")
                         
                         # Encode audio frame
-                        await self._encode_audio_frame_incremental(frame_event)
+                        await self._encode_audio_frame_incremental(frame_event, capture_time)
                         audio_frame_count += 1
                         
                         # Release frame reference immediately after encoding
@@ -1099,7 +1101,7 @@ class ParticipantRecorder:
                     packet.stream = self._video_stream
                 
                 # Log before muxing
-                logger.info(
+                logger.debug(
                     f"Frame {frame_index}, Packet {packet_idx}: Muxing packet - "
                     f"pts={packet.pts}, dts={packet.dts}, duration={packet.duration}, tb={packet.time_base}"
                 )
@@ -1127,7 +1129,7 @@ class ParticipantRecorder:
         # PyAV encode operations are typically < 10ms per frame
         self._encode_video_frame_incremental_sync(frame_event, frame_index, capture_time)
 
-    def _encode_audio_frame_incremental_sync(self, frame_event: AudioFrameEvent) -> None:
+    def _encode_audio_frame_incremental_sync(self, frame_event: AudioFrameEvent, capture_time: float) -> None:
         """Encode a single audio frame incrementally (synchronous)."""
         if not self._audio_stream or not self._output_container:
             return
@@ -1136,16 +1138,28 @@ class ParticipantRecorder:
         sample_rate = frame.sample_rate
         samples_per_channel = frame.samples_per_channel
         
-        # Calculate audio PTS based on cumulative samples
-        # Use time_base of audio stream (1/sample_rate) to avoid timestamp issues
-        # PTS = cumulative_samples (since time_base is 1/sample_rate)
+        # Calculate Audio PTS based on Wall Clock Time
+        # This ensures audio aligns with video and handles gaps (VFR) correctly
+        # instead of "compressing" time by assuming continuous samples.
         
-        # CRITICAL: Audio PTS must start at 0 relative to the start of recording
-        # If this is the first audio packet, ensure PTS is 0
-        # if self._cumulative_audio_samples == 0:
-        #     pass
+        # Use stream timebase (likely 1/sample_rate)
+        time_base_denominator = sample_rate
+        time_base_numerator = 1
+        
+        if self._audio_stream.time_base:
+            time_base_denominator = self._audio_stream.time_base.denominator
+            time_base_numerator = self._audio_stream.time_base.numerator
             
-        audio_pts = self._cumulative_audio_samples
+        if self._start_time is not None:
+            time_since_start_s = capture_time - self._start_time
+            if time_since_start_s < 0:
+                time_since_start_s = 0
+            
+            # Calculate PTS: seconds * (den / num)
+            audio_pts = int(time_since_start_s * time_base_denominator / time_base_numerator)
+        else:
+            # Fallback to cumulative samples if no start time (shouldn't happen)
+            audio_pts = self._cumulative_audio_samples
         
         # Convert and encode frame
         pyav_frame = self._convert_audio_frame_to_pyav(frame, self._audio_stream, audio_pts)
@@ -1212,10 +1226,10 @@ class ParticipantRecorder:
         if self._cumulative_audio_samples % (sample_rate * 4) == 0:
             gc.collect()
 
-    async def _encode_audio_frame_incremental(self, frame_event: AudioFrameEvent) -> None:
+    async def _encode_audio_frame_incremental(self, frame_event: AudioFrameEvent, capture_time: float) -> None:
         """Encode a single audio frame incrementally."""
         # Encoding is fast enough that we can do it directly in async context
-        self._encode_audio_frame_incremental_sync(frame_event)
+        self._encode_audio_frame_incremental_sync(frame_event, capture_time)
 
     async def stop_recording(self, output_path: str) -> str:
         """Stop recording and save to a WebM file.
