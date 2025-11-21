@@ -547,14 +547,15 @@ class ParticipantRecorder:
                                 self._video_stream.options = encoding_options
                                 logger.info(f"Video encoding: {video_width}x{video_height} @ {actual_bitrate/1_000_000:.2f} Mbps, quality={self.video_quality}")
                                 
-                                # CRITICAL: Force time_base to 1/1000 (standard for WebM)
-                                # This is the only robust way to ensure containers like WebM interpret timestamps as milliseconds.
-                                self._video_stream.time_base = Fraction(1, 1000)
+                                # CRITICAL: Allow PyAV to determine best time_base (likely 1/FPS)
+                                # We will convert to 1/1000 ONLY if the container specifically demands it during muxing
+                                # This prevents fighting the encoder's native timebase
+                                # self._video_stream.time_base = Fraction(1, 1000)
                                 
                                 if self._video_stream.time_base:
-                                    logger.info(f"Stream time_base set to: {self._video_stream.time_base}")
+                                    logger.info(f"Stream time_base auto-detected as: {self._video_stream.time_base}")
                                 else:
-                                    logger.warning("Stream time_base is None after add_stream")
+                                    logger.warning("Stream time_base is None after add_stream - will fallback to 1/FPS")
 
                                 self._video_stream_initialized = True
                                 logger.info(
@@ -966,29 +967,40 @@ class ParticipantRecorder:
         time_base_denominator = 1000
         time_base_numerator = 1
         
+        stream_time_base = self._video_stream.time_base
+        if stream_time_base:
+            time_base_denominator = stream_time_base.denominator
+            time_base_numerator = stream_time_base.numerator
+            logger.debug(f"Using stream timebase for PTS calc: {stream_time_base}")
+        else:
+            logger.warning("Stream timebase missing for PTS calc, using 1/1000")
+
         if self._first_video_frame_time is not None:
             time_since_first_us = frame_event.timestamp_us - self._first_video_frame_time
-            # Calculate PTS in milliseconds
-            pts = int(time_since_first_us / 1000)
+            # Calculate PTS in stream timebase units
+            # PTS = (us / 1_000_000) * (den / num)
+            pts = (time_since_first_us * time_base_denominator) // (1_000_000 * time_base_numerator)
             
             # Enforce strictly monotonic increasing timestamps
             if pts <= self._last_video_pts:
                  pts = self._last_video_pts + 1
         else:
             # Fallback if no timestamps: assume 30fps (33ms per frame)
-            pts = frame_index * 33
+            # Scale to stream timebase
+            # 1 frame = 1/30 sec
+            # PTS = index * (1/30) * (den / num)
+            pts = (frame_index * time_base_denominator) // (30 * time_base_numerator)
         
+        logger.debug(f"Calculated PTS: {pts} for frame {frame_index} (stream_tb={stream_time_base})")
         self._last_video_pts = pts
         
         # Convert and encode frame
         frame = frame_event.frame
         pyav_frame = self._convert_video_frame_to_pyav(frame, self._video_stream, pts)
         
-        # CRITICAL: Tell the encoder that our PTS values are in 1/1000 units (milliseconds)
-        # If we don't set this, the encoder might assume 1/FPS (e.g. 1/30) and interpret
-        # "1000" as "1000 frames" (33 seconds) instead of "1 second", causing massive duration inflation.
-        if pyav_frame:
-             pyav_frame.time_base = Fraction(1, 1000)
+        # Set time_base on the frame to match the stream
+        if pyav_frame and stream_time_base:
+             pyav_frame.time_base = stream_time_base
         
         if pyav_frame and self._video_stream:
             # CRITICAL FIX: Ensure packet time_base matches stream time_base
