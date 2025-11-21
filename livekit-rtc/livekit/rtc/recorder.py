@@ -652,19 +652,40 @@ class ParticipantRecorder:
                     # This prevents 0xc0000094 (Divide by Zero) crash in avformat
                     if packet.time_base != self._video_stream.time_base:
                         logger.debug(f"Converting packet time_base from {packet.time_base} to {self._video_stream.time_base}")
-                        # Convert PTS/DTS from packet time_base to stream time_base
+                        # Use integer arithmetic to convert PTS/DTS
                         if (packet.time_base and self._video_stream.time_base and 
                             packet.time_base.denominator > 0 and 
-                            self._video_stream.time_base.denominator > 0):
+                            self._video_stream.time_base.denominator > 0 and
+                            packet.time_base.numerator > 0 and
+                            self._video_stream.time_base.numerator > 0):
+                            
+                            old_num = packet.time_base.numerator
+                            old_den = packet.time_base.denominator
+                            new_num = self._video_stream.time_base.numerator
+                            new_den = self._video_stream.time_base.denominator
+                            
                             # Convert PTS
                             if packet.pts is not None:
-                                packet_pts_sec = packet.pts * packet.time_base
-                                packet.pts = int(packet_pts_sec / self._video_stream.time_base)
+                                numerator = packet.pts * old_num * new_den
+                                denominator = old_den * new_num
+                                if denominator > 0:
+                                    packet.pts = numerator // denominator
+                                else:
+                                    packet.pts = 0
+                            
                             # Convert DTS
                             if packet.dts is not None:
-                                packet_dts_sec = packet.dts * packet.time_base
-                                packet.dts = int(packet_dts_sec / self._video_stream.time_base)
-                        # Set packet time_base to match stream (safe even if conversion failed)
+                                numerator = packet.dts * old_num * new_den
+                                denominator = old_den * new_num
+                                if denominator > 0:
+                                    packet.dts = numerator // denominator
+                                else:
+                                    packet.dts = 0
+                        
+                        # Set packet time_base to match stream
+                        if self._video_stream.time_base:
+                            packet.time_base = self._video_stream.time_base
+                    elif packet.time_base is None:
                         if self._video_stream.time_base:
                             packet.time_base = self._video_stream.time_base
                     self._output_container.mux(packet)
@@ -674,19 +695,40 @@ class ParticipantRecorder:
                     # Same fix for audio packets
                     if packet.time_base != self._audio_stream.time_base:
                         logger.debug(f"Converting audio packet time_base from {packet.time_base} to {self._audio_stream.time_base}")
-                        # Convert PTS/DTS from packet time_base to stream time_base
+                        # Use integer arithmetic to convert PTS/DTS
                         if (packet.time_base and self._audio_stream.time_base and 
                             packet.time_base.denominator > 0 and 
-                            self._audio_stream.time_base.denominator > 0):
+                            self._audio_stream.time_base.denominator > 0 and
+                            packet.time_base.numerator > 0 and
+                            self._audio_stream.time_base.numerator > 0):
+                            
+                            old_num = packet.time_base.numerator
+                            old_den = packet.time_base.denominator
+                            new_num = self._audio_stream.time_base.numerator
+                            new_den = self._audio_stream.time_base.denominator
+                            
                             # Convert PTS
                             if packet.pts is not None:
-                                packet_pts_sec = packet.pts * packet.time_base
-                                packet.pts = int(packet_pts_sec / self._audio_stream.time_base)
+                                numerator = packet.pts * old_num * new_den
+                                denominator = old_den * new_num
+                                if denominator > 0:
+                                    packet.pts = numerator // denominator
+                                else:
+                                    packet.pts = 0
+                            
                             # Convert DTS
                             if packet.dts is not None:
-                                packet_dts_sec = packet.dts * packet.time_base
-                                packet.dts = int(packet_dts_sec / self._audio_stream.time_base)
-                        # Set packet time_base to match stream (safe even if conversion failed)
+                                numerator = packet.dts * old_num * new_den
+                                denominator = old_den * new_num
+                                if denominator > 0:
+                                    packet.dts = numerator // denominator
+                                else:
+                                    packet.dts = 0
+                        
+                        # Set packet time_base to match stream
+                        if self._audio_stream.time_base:
+                            packet.time_base = self._audio_stream.time_base
+                    elif packet.time_base is None:
                         if self._audio_stream.time_base:
                             packet.time_base = self._audio_stream.time_base
                     self._output_container.mux(packet)
@@ -869,19 +911,47 @@ class ParticipantRecorder:
                         f"Frame {frame_index}: Fixing packet time_base mismatch - "
                         f"packet: {packet.time_base}, stream: {self._video_stream.time_base}"
                     )
-                    # Convert PTS/DTS from packet time_base to stream time_base
+                    
+                    # Use integer arithmetic to convert PTS/DTS to avoid floating point errors
+                    # Formula: new_pts = (old_pts * old_num * new_den) / (old_den * new_num)
                     if (packet.time_base and self._video_stream.time_base and 
                         packet.time_base.denominator > 0 and 
-                        self._video_stream.time_base.denominator > 0):
-                        # Convert PTS
+                        self._video_stream.time_base.denominator > 0 and
+                        packet.time_base.numerator > 0 and
+                        self._video_stream.time_base.numerator > 0):
+                        
+                        old_num = packet.time_base.numerator
+                        old_den = packet.time_base.denominator
+                        new_num = self._video_stream.time_base.numerator
+                        new_den = self._video_stream.time_base.denominator
+                        
+                        # Convert PTS using integer arithmetic
                         if packet.pts is not None:
-                            packet_pts_sec = packet.pts * packet.time_base
-                            packet.pts = int(packet_pts_sec / self._video_stream.time_base)
-                        # Convert DTS
+                            # new_pts = (old_pts * old_num * new_den) / (old_den * new_num)
+                            numerator = packet.pts * old_num * new_den
+                            denominator = old_den * new_num
+                            if denominator > 0:
+                                packet.pts = numerator // denominator
+                            else:
+                                logger.warning(f"Invalid denominator in PTS conversion: {denominator}")
+                                packet.pts = 0
+                        
+                        # Convert DTS using integer arithmetic
                         if packet.dts is not None:
-                            packet_dts_sec = packet.dts * packet.time_base
-                            packet.dts = int(packet_dts_sec / self._video_stream.time_base)
-                    # Set packet time_base to match stream (safe even if conversion failed)
+                            numerator = packet.dts * old_num * new_den
+                            denominator = old_den * new_num
+                            if denominator > 0:
+                                packet.dts = numerator // denominator
+                            else:
+                                logger.warning(f"Invalid denominator in DTS conversion: {denominator}")
+                                packet.dts = 0
+                    
+                    # Set packet time_base to match stream
+                    if self._video_stream.time_base:
+                        packet.time_base = self._video_stream.time_base
+                elif packet.time_base is None:
+                    # If packet has no time_base, set it to stream's time_base
+                    logger.debug(f"Frame {frame_index}: Packet has no time_base, setting to stream time_base")
                     if self._video_stream.time_base:
                         packet.time_base = self._video_stream.time_base
                 
