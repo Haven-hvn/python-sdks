@@ -227,6 +227,7 @@ class ParticipantRecorder:
             self._first_video_frame_time = None
             self._cumulative_audio_samples = 0
             self._video_frame_count = 0
+            self._last_video_pts = -1  # Reset monotonic PTS tracker
 
             # Subscribe to all published tracks
             await self._subscribe_to_participant_tracks(participant)
@@ -1009,7 +1010,7 @@ class ParticipantRecorder:
             # PTS = index * (1/30) * (den / num)
             pts = (frame_index * time_base_denominator) // (30 * time_base_numerator)
         
-        logger.debug(f"Calculated PTS: {pts} for frame {frame_index} (stream_tb={stream_time_base})")
+        logger.info(f"Calculated PTS: {pts} for frame {frame_index} (stream_tb={stream_time_base})")
         self._last_video_pts = pts
         
         # Convert and encode frame
@@ -1017,8 +1018,12 @@ class ParticipantRecorder:
         pyav_frame = self._convert_video_frame_to_pyav(frame, self._video_stream, pts)
         
         # Set time_base on the frame to match the stream
-        if pyav_frame and stream_time_base:
-             pyav_frame.time_base = stream_time_base
+        if pyav_frame:
+            if stream_time_base:
+                pyav_frame.time_base = stream_time_base
+            else:
+                # Force 1/1000 if stream has no timebase (it will learn from frame)
+                pyav_frame.time_base = Fraction(1, 1000)
         
         if pyav_frame and self._video_stream:
             # CRITICAL FIX: Ensure packet time_base matches stream time_base
@@ -1473,7 +1478,10 @@ class ParticipantRecorder:
                     pyav_frame.time_base = stream.time_base
                 except (AttributeError, ValueError, TypeError) as e:
                     logger.warning(f"Could not set time_base: {e}")
-                    # Continue without time_base - PyAV may infer it
+            else:
+                # Fallback: If stream has no timebase (yet), assume 1/1000 because
+                # that's what we use for PTS calculation in _encode_video_frame_incremental_sync
+                pyav_frame.time_base = Fraction(1, 1000)
 
             # Release converted frame reference if we created one
             # This helps GC free the conversion buffer sooner
