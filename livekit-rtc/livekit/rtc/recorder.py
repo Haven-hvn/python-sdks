@@ -978,20 +978,21 @@ class ParticipantRecorder:
             time_base_numerator = 1
         
         if self._first_video_frame_time is not None:
-            time_since_first_sec = (frame_event.timestamp_us - self._first_video_frame_time) / 1_000_000.0
-            pts = int(time_since_first_sec * time_base_denominator / time_base_numerator)
+            # CRITICAL FIX: Use integer arithmetic for precise PTS calculation
+            # time_since_first_us = frame_event.timestamp_us - self._first_video_frame_time
+            # pts = (time_since_first_us * time_base_denominator) // (1_000_000 * time_base_numerator)
+            
+            # Better approach: Use frame index for constant frame rate video
+            # This guarantees smooth playback and correct duration metadata
+            # For variable frame rate, we'd need the timestamp approach
+            pts = frame_index
         else:
-            # Fallback
-            frame_interval = int(time_base_denominator / (self.video_fps * time_base_numerator))
-            if frame_interval < 1:
-                frame_interval = 1
-            pts = frame_index * frame_interval
+            pts = frame_index
         
         # Enforce monotonicity of PTS
-        # This prevents potential muxer crashes if timestamps jitter backwards
         if pts <= self._last_video_pts:
-            pts = self._last_video_pts + 1
-            logger.debug(f"Frame {frame_index}: Adjusted PTS to {pts} to ensure monotonicity (was <= {self._last_video_pts})")
+             # Just increment if we somehow got a duplicate or out-of-order index
+             pts = self._last_video_pts + 1
         self._last_video_pts = pts
         
         # Convert and encode frame
@@ -1098,6 +1099,12 @@ class ParticipantRecorder:
         # Calculate audio PTS based on cumulative samples
         # Use time_base of audio stream (1/sample_rate) to avoid timestamp issues
         # PTS = cumulative_samples (since time_base is 1/sample_rate)
+        
+        # CRITICAL: Audio PTS must start at 0 relative to the start of recording
+        # If this is the first audio packet, ensure PTS is 0
+        # if self._cumulative_audio_samples == 0:
+        #     pass
+            
         audio_pts = self._cumulative_audio_samples
         
         # Convert and encode frame
