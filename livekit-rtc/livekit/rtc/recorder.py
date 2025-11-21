@@ -978,21 +978,17 @@ class ParticipantRecorder:
             time_base_numerator = 1
         
         if self._first_video_frame_time is not None:
-            # CRITICAL FIX: Use integer arithmetic for precise PTS calculation
-            # time_since_first_us = frame_event.timestamp_us - self._first_video_frame_time
-            # pts = (time_since_first_us * time_base_denominator) // (1_000_000 * time_base_numerator)
+            # Use wall-clock time for PTS to handle variable network arrival rates
+            # This ensures audio/video sync even if frames arrive irregularly
+            time_since_first_us = frame_event.timestamp_us - self._first_video_frame_time
+            pts = (time_since_first_us * time_base_denominator) // (1_000_000 * time_base_numerator)
             
-            # Better approach: Use frame index for constant frame rate video
-            # This guarantees smooth playback and correct duration metadata
-            # For variable frame rate, we'd need the timestamp approach
-            pts = frame_index
+            # Enforce strictly monotonic increasing timestamps
+            if pts <= self._last_video_pts:
+                 pts = self._last_video_pts + 1
         else:
             pts = frame_index
         
-        # Enforce monotonicity of PTS
-        if pts <= self._last_video_pts:
-             # Just increment if we somehow got a duplicate or out-of-order index
-             pts = self._last_video_pts + 1
         self._last_video_pts = pts
         
         # Convert and encode frame
