@@ -48,32 +48,27 @@ logger = logging.getLogger(__name__)
 
 class RecordingError(Exception):
     """Base exception for recording-related errors."""
-
     pass
 
 
 class ParticipantNotFoundError(RecordingError):
     """Raised when a participant is not found in the room."""
-
     pass
 
 
 class TrackNotFoundError(RecordingError):
     """Raised when a track is not found or not available."""
-
     pass
 
 
 class WebMEncoderNotAvailableError(RecordingError):
     """Raised when WebM encoding libraries are not available."""
-
     pass
 
 
 @dataclass
 class RecordingStats:
     """Statistics for a recording session."""
-
     video_frames_recorded: int = 0
     audio_frames_recorded: int = 0
     recording_duration_seconds: float = 0.0
@@ -456,7 +451,6 @@ class ParticipantRecorder:
         container_init_lock = asyncio.Lock()
         
         try:
-            
             # Process frames from queues as they arrive
             video_frame_count = 0
             audio_frame_count = 0
@@ -469,7 +463,7 @@ class ParticipantRecorder:
                 frames_processed = False
                 logger.debug("Video frame processing task started")
                 while self._is_recording or not self._video_queue.empty():
-                    # [NEW] Debug log every 50 frames
+                    # Debug log every 50 frames
                     if video_frame_count % 50 == 0:
                         try:
                             import psutil, os
@@ -525,7 +519,7 @@ class ParticipantRecorder:
                             video_width = frame.width
                             video_height = frame.height
                             
-                            # [NEW] Log exact parameters before stream creation
+                            # Log exact parameters before stream creation
                             logger.info(
                                 f"Attempting to add_stream: codec={self.video_codec}, "
                                 f"rate={self.video_fps}, width={video_width}, height={video_height}, "
@@ -654,10 +648,47 @@ class ParticipantRecorder:
             # Flush encoders
             if self._video_stream:
                 for packet in self._video_stream.encode():
+                    # CRITICAL FIX: Ensure packet time_base matches stream time_base before muxing
+                    # This prevents 0xc0000094 (Divide by Zero) crash in avformat
+                    if packet.time_base != self._video_stream.time_base:
+                        logger.debug(f"Converting packet time_base from {packet.time_base} to {self._video_stream.time_base}")
+                        # Convert PTS/DTS from packet time_base to stream time_base
+                        if (packet.time_base and self._video_stream.time_base and 
+                            packet.time_base.denominator > 0 and 
+                            self._video_stream.time_base.denominator > 0):
+                            # Convert PTS
+                            if packet.pts is not None:
+                                packet_pts_sec = packet.pts * packet.time_base
+                                packet.pts = int(packet_pts_sec / self._video_stream.time_base)
+                            # Convert DTS
+                            if packet.dts is not None:
+                                packet_dts_sec = packet.dts * packet.time_base
+                                packet.dts = int(packet_dts_sec / self._video_stream.time_base)
+                        # Set packet time_base to match stream (safe even if conversion failed)
+                        if self._video_stream.time_base:
+                            packet.time_base = self._video_stream.time_base
                     self._output_container.mux(packet)
             
             if self._audio_stream:
                 for packet in self._audio_stream.encode():
+                    # Same fix for audio packets
+                    if packet.time_base != self._audio_stream.time_base:
+                        logger.debug(f"Converting audio packet time_base from {packet.time_base} to {self._audio_stream.time_base}")
+                        # Convert PTS/DTS from packet time_base to stream time_base
+                        if (packet.time_base and self._audio_stream.time_base and 
+                            packet.time_base.denominator > 0 and 
+                            self._audio_stream.time_base.denominator > 0):
+                            # Convert PTS
+                            if packet.pts is not None:
+                                packet_pts_sec = packet.pts * packet.time_base
+                                packet.pts = int(packet_pts_sec / self._audio_stream.time_base)
+                            # Convert DTS
+                            if packet.dts is not None:
+                                packet_dts_sec = packet.dts * packet.time_base
+                                packet.dts = int(packet_dts_sec / self._audio_stream.time_base)
+                        # Set packet time_base to match stream (safe even if conversion failed)
+                        if self._audio_stream.time_base:
+                            packet.time_base = self._audio_stream.time_base
                     self._output_container.mux(packet)
             
             logger.info(f"Incremental encoding completed: {video_frame_count} video, {audio_frame_count} audio frames")
@@ -799,31 +830,14 @@ class ParticipantRecorder:
         return options
 
     def _encode_video_frame_incremental_sync(self, frame_event: VideoFrameEvent, frame_index: int) -> None:
-        """Encode a single video frame incrementally (synchronous) with DEBUG logging."""
+        """Encode a single video frame incrementally (synchronous) with timebase fix.
         
-        # [DEBUG] Trace entry
-        logger.info(f"DEBUG: Entering _encode for frame {frame_index}")
-
+        CRITICAL FIX: Ensures packet time_base matches stream time_base before muxing
+        to prevent 0xc0000094 (Divide by Zero) crash in avformat.
+        """
         if not self._video_stream or not self._output_container:
-            logger.warning("DEBUG: Stream or container is None")
             return
         
-        # [DEBUG] Inspect Stream Timebase
-        tb = self._video_stream.time_base
-        if tb:
-            logger.info(f"DEBUG: Stream time_base: {tb.numerator}/{tb.denominator}")
-            if tb.numerator == 0 or tb.denominator == 0:
-                logger.critical("❌ CRITICAL: Stream time_base has ZERO component!")
-        else:
-            logger.info("DEBUG: Stream time_base is None! (Setting default 1/1000)")
-        
-        # [DEBUG] Inspect Container Timebase (if accessible)
-        # Some PyAV versions expose it on the container or stream context
-        try:
-            logger.info(f"DEBUG: Stream ID: {self._video_stream.index}, codec: {self._video_stream.name}")
-        except Exception as e:
-            logger.warning(f"DEBUG: Could not inspect stream details: {e}")
-
         # Calculate PTS
         if self._video_stream.time_base:
             time_base_denominator = self._video_stream.time_base.denominator
@@ -835,54 +849,46 @@ class ParticipantRecorder:
         if self._first_video_frame_time is not None:
             time_since_first_sec = (frame_event.timestamp_us - self._first_video_frame_time) / 1_000_000.0
             pts = int(time_since_first_sec * time_base_denominator / time_base_numerator)
-            logger.info(f"DEBUG: PTS calc: {pts} (time: {time_since_first_sec:.4f}s)")
         else:
             # Fallback
             frame_interval = int(time_base_denominator / (self.video_fps * time_base_numerator))
-            if frame_interval < 1: frame_interval = 1
+            if frame_interval < 1:
+                frame_interval = 1
             pts = frame_index * frame_interval
-            logger.info(f"DEBUG: PTS fallback: {pts}")
         
-        # Convert Frame
-        logger.info("DEBUG: Converting frame to PyAV...")
+        # Convert and encode frame
         frame = frame_event.frame
         pyav_frame = self._convert_video_frame_to_pyav(frame, self._video_stream, pts)
         
         if pyav_frame and self._video_stream:
-            # [DEBUG] Inspect PyAV Frame
-            logger.info(
-                f"DEBUG: PyAV Frame ready. "
-                f"PTS: {pyav_frame.pts}, "
-                f"TimeBase: {pyav_frame.time_base}, "
-                f"Size: {pyav_frame.width}x{pyav_frame.height}, "
-                f"Fmt: {pyav_frame.format.name}"
-            )
-
-            try:
-                # [DEBUG] Encode
-                logger.info("DEBUG: Calling stream.encode()...")
-                packets = self._video_stream.encode(pyav_frame)
-                logger.info(f"DEBUG: stream.encode() returned generator/list")
-
-                # [DEBUG] Mux Loop
-                for i, packet in enumerate(packets):
-                    ptb = packet.time_base
-                    logger.info(
-                        f"DEBUG: Packet {i} -> "
-                        f"pts={packet.pts}, dts={packet.dts}, "
-                        f"tb={ptb.numerator}/{ptb.denominator} if ptb else None, "
-                        f"stream_index={packet.stream.index}"
+            # CRITICAL FIX: Ensure packet time_base matches stream time_base
+            for packet in self._video_stream.encode(pyav_frame):
+                # Fix timebase mismatch that causes 0xc0000094 crash
+                if packet.time_base != self._video_stream.time_base:
+                    logger.debug(
+                        f"Frame {frame_index}: Fixing packet time_base mismatch - "
+                        f"packet: {packet.time_base}, stream: {self._video_stream.time_base}"
                     )
-                    
-                    logger.info("DEBUG: Calling output_container.mux(packet)...")
-                    self._output_container.mux(packet)
-                    logger.info("DEBUG: mux() success")
-
-            except Exception as e:
-                logger.critical(f"❌ CRITICAL: Crash inside encode/mux loop: {e}")
-                raise
-        else:
-            logger.warning("DEBUG: pyav_frame conversion returned None")
+                    # Convert PTS/DTS from packet time_base to stream time_base
+                    if (packet.time_base and self._video_stream.time_base and 
+                        packet.time_base.denominator > 0 and 
+                        self._video_stream.time_base.denominator > 0):
+                        # Convert PTS
+                        if packet.pts is not None:
+                            packet_pts_sec = packet.pts * packet.time_base
+                            packet.pts = int(packet_pts_sec / self._video_stream.time_base)
+                        # Convert DTS
+                        if packet.dts is not None:
+                            packet_dts_sec = packet.dts * packet.time_base
+                            packet.dts = int(packet_dts_sec / self._video_stream.time_base)
+                    # Set packet time_base to match stream (safe even if conversion failed)
+                    if self._video_stream.time_base:
+                        packet.time_base = self._video_stream.time_base
+                
+                self._output_container.mux(packet)
+        
+        # Release frame reference immediately
+        del pyav_frame
         
         # Periodic GC
         if frame_index > 0 and frame_index % 50 == 0:
@@ -1087,256 +1093,6 @@ class ParticipantRecorder:
             logger.info(f"Recording saved to {output_file}")
             return output_file
 
-    async def _encode_to_webm(self, output_path: str) -> str:
-        """Encode captured frames to a WebM file incrementally.
-        
-        This method processes frames as they're dequeued rather than collecting
-        all frames first, significantly reducing memory usage for long recordings.
-        """
-        output_file = Path(output_path).resolve()
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-
-        # Check if we have any frames to encode
-        if self._video_queue.empty() and self._audio_queue.empty():
-            logger.warning(
-                "No frames captured during recording. Creating empty file will be skipped."
-            )
-            # Create an empty file but mark it as such
-            output_file.touch()
-            return str(output_file)
-
-        # Process frames incrementally - collect them in small batches and sort
-        # This allows us to process frames in order while limiting memory usage
-        # We'll collect frames in batches, sort each batch, then encode incrementally
-        video_frames_batch: list[VideoFrameEvent] = []
-        audio_frames_batch: list[AudioFrameEvent] = []
-        
-        # Collect remaining frames from queues (queues are bounded so this is limited)
-        while True:
-            try:
-                frame_event = self._video_queue.get_nowait()
-                video_frames_batch.append(frame_event)
-            except asyncio.QueueEmpty:
-                break
-
-        while True:
-            try:
-                frame_event = self._audio_queue.get_nowait()
-                audio_frames_batch.append(frame_event)
-            except asyncio.QueueEmpty:
-                break
-
-        # Sort frames by timestamp to ensure proper synchronization order
-        # Since queues are bounded (max ~5 seconds of frames), sorting is still efficient
-        video_frames_batch.sort(key=lambda e: e.timestamp_us)
-        # Audio frames don't have timestamps, but we'll process them in order
-
-        # Run encoding in a thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
-        absolute_path = await loop.run_in_executor(
-            None,
-            self._encode_to_webm_sync,
-            str(output_file),
-            video_frames_batch,
-            audio_frames_batch,
-        )
-
-        # Clear frames from memory after encoding to prevent memory leaks
-        del video_frames_batch
-        del audio_frames_batch
-
-        # Get file size
-        output_file_obj = Path(absolute_path)
-        if output_file_obj.exists():
-            self._stats.output_file_size_bytes = output_file_obj.stat().st_size
-
-        return absolute_path
-
-    def _encode_to_webm_sync(
-        self,
-        output_path: str,
-        video_frames: list[VideoFrameEvent],
-        audio_frames: list[AudioFrameEvent],
-    ) -> str:
-        """Synchronously encode frames to WebM (runs in executor)."""
-        logger.info(f"Starting WebM encoding: {len(video_frames)} video frames, {len(audio_frames)} audio frames")
-        # Create output container
-        output_container = av.open(output_path, mode="w", format="webm")
-
-        try:
-            video_stream: Optional[av.VideoStream] = None
-            audio_stream: Optional[av.AudioStream] = None
-
-            # Determine video properties from first frame
-            if video_frames:
-                first_video_frame = video_frames[0].frame
-                video_width = first_video_frame.width
-                video_height = first_video_frame.height
-
-                # Add video stream
-                video_stream = output_container.add_stream(
-                    self.video_codec,
-                    rate=self.video_fps,
-                )
-                video_stream.width = video_width
-                video_stream.height = video_height
-                video_stream.pix_fmt = "yuv420p"
-                # Calculate optimal bitrate if auto_bitrate is enabled
-                actual_bitrate = self._calculate_bitrate(video_width, video_height)
-                # Build encoding options with quality settings
-                video_stream.options = self._get_video_encoding_options(actual_bitrate)
-
-            # Add audio stream
-            if audio_frames:
-                first_audio_frame = audio_frames[0].frame
-                audio_stream = output_container.add_stream(self.audio_codec)
-                audio_stream.rate = first_audio_frame.sample_rate
-                # Set layout (channels is read-only on stream and codec_context)
-                # Determine layout string based on number of channels
-                if first_audio_frame.num_channels == 1:
-                    layout_str = "mono"
-                elif first_audio_frame.num_channels == 2:
-                    layout_str = "stereo"
-                else:
-                    layout_str = f"{first_audio_frame.num_channels}"
-                audio_stream.codec_context.layout = layout_str
-                audio_stream.options = {"bitrate": str(self.audio_bitrate)}
-
-            # Encode video frames using frame-based PTS calculation
-            # Calculate spacing based on actual recording duration to ensure correct playback speed
-            if video_stream:
-                total_video_frames = len(video_frames)
-                logger.debug(f"Encoding {total_video_frames} video frames...")
-                
-                # Calculate frame interval in time_base units
-                if video_stream.time_base:
-                    time_base_denominator = video_stream.time_base.denominator
-                    time_base_numerator = video_stream.time_base.numerator
-                else:
-                    time_base_denominator = 1000
-                    time_base_numerator = 1
-                
-                # Calculate actual frame rate from recording duration
-                # This ensures video plays at correct speed over the full duration
-                recording_duration_sec = self._stats.recording_duration_seconds
-                if recording_duration_sec > 0 and total_video_frames > 0:
-                    # Calculate actual frame rate from captured frames
-                    actual_fps = total_video_frames / recording_duration_sec
-                    logger.debug(f"Recording duration: {recording_duration_sec:.2f}s, frames: {total_video_frames}, actual FPS: {actual_fps:.2f}")
-                else:
-                    # Fallback to target FPS
-                    actual_fps = self.video_fps
-                
-                # Calculate frame interval based on actual frame rate
-                # This ensures frames are evenly spaced over the recording duration
-                # frame_interval = time_base_denominator / (actual_fps * time_base_numerator)
-                frame_interval = int(time_base_denominator / (actual_fps * time_base_numerator))
-                if frame_interval < 1:
-                    frame_interval = 1
-                
-                logger.debug(f"Frame interval: {frame_interval} PTS units ({frame_interval/1000:.3f} ms per frame at {actual_fps:.2f} fps)")
-                
-                # Calculate PTS for each frame based on frame index
-                # This ensures frames are spaced correctly at the target frame rate
-                for idx, frame_event in enumerate(video_frames):
-                    if idx > 0 and idx % 100 == 0:
-                        logger.debug(f"Encoding video frame {idx}/{len(video_frames)}...")
-                    frame = frame_event.frame
-                    
-                    # Calculate PTS based on frame index
-                    # PTS = frame_index * frame_interval
-                    # Frame 0: PTS = 0 (starts immediately)
-                    # Frame 1: PTS = frame_interval (~33ms at 30fps)
-                    # Frame 30: PTS = 30 * frame_interval (~1 second at 30fps)
-                    pts = idx * frame_interval
-                    
-                    # Convert VideoFrame to PyAV frame
-                    pyav_frame = self._convert_video_frame_to_pyav(
-                        frame, video_stream, pts
-                    )
-                    if pyav_frame and video_stream:
-                        for packet in video_stream.encode(pyav_frame):
-                            output_container.mux(packet)
-                    
-                    # Explicitly release frame references to help GC
-                    # This is critical for memory efficiency as frames can be large (~3-4MB each)
-                    del pyav_frame
-                    # Also release the frame reference from the event
-                    # This helps Python GC free the underlying frame data sooner
-                    frame_event.frame = None  # type: ignore
-                    
-                    # Trigger GC periodically to free memory (every 50 frames)
-                    # This helps prevent memory accumulation during encoding
-                    if idx > 0 and idx % 50 == 0:
-                        gc.collect()
-
-            # Flush video encoder
-            if video_stream:
-                for packet in video_stream.encode():
-                    output_container.mux(packet)
-
-            # Encode audio frames synchronized with video timestamps
-            # Calculate audio PTS based on cumulative samples, aligned with video timing
-            # Use the same time_base as video (1/1000 milliseconds) for consistency
-            if audio_stream:
-                sample_rate = audio_frames[0].frame.sample_rate if audio_frames else 48000
-                
-                # Calculate audio PTS in milliseconds (same time_base as video: 1/1000)
-                # Audio PTS should match the video timing based on sample count
-                cumulative_samples = 0
-                
-                for frame_event in audio_frames:
-                    frame = frame_event.frame
-                    samples_per_channel = frame.samples_per_channel
-                    
-                    # Calculate PTS in milliseconds based on cumulative samples
-                    # This naturally aligns with video timing since both start from 0
-                    # PTS_ms = (cumulative_samples / sample_rate) * 1000
-                    audio_pts_ms = int((cumulative_samples / sample_rate) * 1000)
-                    
-                    # Convert AudioFrame to PyAV frame
-                    pyav_frame = self._convert_audio_frame_to_pyav(
-                        frame, audio_stream, audio_pts_ms
-                    )
-                    if pyav_frame and audio_stream:
-                        for packet in audio_stream.encode(pyav_frame):
-                            output_container.mux(packet)
-                        # Increment by samples per channel for next frame
-                        cumulative_samples += samples_per_channel
-                    
-                    # Explicitly release frame references to help GC
-                    del pyav_frame
-                    # Release the frame reference from the event to help GC free audio data
-                    frame_event.frame = None  # type: ignore
-                    
-                    # Trigger GC periodically (every 200 audio frames since they're smaller)
-                    if cumulative_samples % (sample_rate * 4) == 0:  # Every ~4 seconds of audio
-                        gc.collect()
-
-            # Flush audio encoder
-            if audio_stream:
-                for packet in audio_stream.encode():
-                    output_container.mux(packet)
-
-        finally:
-            output_container.close()
-            # Explicitly release all frame references to help GC
-            # This is critical for memory efficiency - frames can be several MB each
-            for frame_event in video_frames:
-                if hasattr(frame_event, 'frame'):
-                    frame_event.frame = None  # type: ignore
-            for frame_event in audio_frames:
-                if hasattr(frame_event, 'frame'):
-                    frame_event.frame = None  # type: ignore
-            video_frames.clear()
-            audio_frames.clear()
-            
-            # Force garbage collection after encoding to free memory
-            # This is important because frames can be large and GC might not run immediately
-            gc.collect()
-
-        return output_path
-
     def _convert_video_frame_to_pyav(
         self,
         frame: VideoFrame,
@@ -1351,7 +1107,7 @@ class ParticipantRecorder:
         if not stream:
             return None
 
-        # [NEW] Validate inputs before PyAV call
+        # Validate inputs before PyAV call
         if frame.width <= 0 or frame.height <= 0:
             logger.error(f"❌ Invalid frame dimensions: {frame.width}x{frame.height}")
             return None
