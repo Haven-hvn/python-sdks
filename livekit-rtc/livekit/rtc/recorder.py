@@ -548,7 +548,13 @@ class ParticipantRecorder:
                                 # Set time_base for video (1/1000 for milliseconds-based timing)
                                 self._video_stream.time_base = Fraction(1, 1000)
                                 self._video_stream_initialized = True
-                                logger.info(f"Initialized video stream: {video_width}x{video_height}, first timestamp: {self._first_video_frame_time}us")
+                                logger.info(
+                                    f"✅ Initialized video stream: {video_width}x{video_height}, "
+                                    f"first timestamp: {self._first_video_frame_time}us, "
+                                    f"time_base: {self._video_stream.time_base}, "
+                                    f"bitrate: {actual_bitrate/1_000_000:.2f}Mbps, "
+                                    f"codec: {self.video_codec}, fps: {self.video_fps}"
+                                )
                             except Exception as e:
                                 logger.critical(f"❌ PyAV add_stream failed: {e}")
                                 raise
@@ -647,11 +653,21 @@ class ParticipantRecorder:
             
             # Flush encoders
             if self._video_stream:
+                flush_packet_idx = 0
                 for packet in self._video_stream.encode():
+                    logger.debug(
+                        f"Flush video packet {flush_packet_idx}: "
+                        f"pts={packet.pts}, dts={packet.dts}, "
+                        f"packet_tb={packet.time_base}, stream_tb={self._video_stream.time_base}"
+                    )
+                    
                     # CRITICAL FIX: Ensure packet time_base matches stream time_base before muxing
                     # This prevents 0xc0000094 (Divide by Zero) crash in avformat
                     if packet.time_base != self._video_stream.time_base:
-                        logger.debug(f"Converting packet time_base from {packet.time_base} to {self._video_stream.time_base}")
+                        logger.info(
+                            f"Flush video packet {flush_packet_idx}: ⚠️ Timebase mismatch - "
+                            f"packet: {packet.time_base}, stream: {self._video_stream.time_base}"
+                        )
                         # Use integer arithmetic to convert PTS/DTS
                         if (packet.time_base and self._video_stream.time_base and 
                             packet.time_base.denominator > 0 and 
@@ -666,35 +682,68 @@ class ParticipantRecorder:
                             
                             # Convert PTS
                             if packet.pts is not None:
+                                old_pts = packet.pts
                                 numerator = packet.pts * old_num * new_den
                                 denominator = old_den * new_num
                                 if denominator > 0:
                                     packet.pts = numerator // denominator
+                                    logger.debug(f"Flush video packet {flush_packet_idx}: PTS {old_pts} -> {packet.pts}")
                                 else:
+                                    logger.warning(f"Flush video packet {flush_packet_idx}: ❌ Invalid PTS denominator: {denominator}")
                                     packet.pts = 0
                             
                             # Convert DTS
                             if packet.dts is not None:
+                                old_dts = packet.dts
                                 numerator = packet.dts * old_num * new_den
                                 denominator = old_den * new_num
                                 if denominator > 0:
                                     packet.dts = numerator // denominator
+                                    logger.debug(f"Flush video packet {flush_packet_idx}: DTS {old_dts} -> {packet.dts}")
                                 else:
+                                    logger.warning(f"Flush video packet {flush_packet_idx}: ❌ Invalid DTS denominator: {denominator}")
                                     packet.dts = 0
+                        else:
+                            logger.warning(
+                                f"Flush video packet {flush_packet_idx}: ⚠️ Cannot convert - "
+                                f"packet_tb={packet.time_base}, stream_tb={self._video_stream.time_base}"
+                            )
                         
                         # Set packet time_base to match stream
                         if self._video_stream.time_base:
                             packet.time_base = self._video_stream.time_base
+                            logger.debug(f"Flush video packet {flush_packet_idx}: Timebase set to {packet.time_base}")
                     elif packet.time_base is None:
+                        logger.info(f"Flush video packet {flush_packet_idx}: ⚠️ No timebase, setting to {self._video_stream.time_base}")
                         if self._video_stream.time_base:
                             packet.time_base = self._video_stream.time_base
-                    self._output_container.mux(packet)
+                    
+                    try:
+                        self._output_container.mux(packet)
+                        logger.debug(f"Flush video packet {flush_packet_idx}: ✅ Mux successful")
+                    except Exception as e:
+                        logger.critical(
+                            f"Flush video packet {flush_packet_idx}: ❌ CRITICAL: Mux failed! "
+                            f"pts={packet.pts}, dts={packet.dts}, tb={packet.time_base}, error={e}"
+                        )
+                        raise
+                    flush_packet_idx += 1
             
             if self._audio_stream:
+                flush_audio_packet_idx = 0
                 for packet in self._audio_stream.encode():
+                    logger.debug(
+                        f"Flush audio packet {flush_audio_packet_idx}: "
+                        f"pts={packet.pts}, dts={packet.dts}, "
+                        f"packet_tb={packet.time_base}, stream_tb={self._audio_stream.time_base}"
+                    )
+                    
                     # Same fix for audio packets
                     if packet.time_base != self._audio_stream.time_base:
-                        logger.debug(f"Converting audio packet time_base from {packet.time_base} to {self._audio_stream.time_base}")
+                        logger.info(
+                            f"Flush audio packet {flush_audio_packet_idx}: ⚠️ Timebase mismatch - "
+                            f"packet: {packet.time_base}, stream: {self._audio_stream.time_base}"
+                        )
                         # Use integer arithmetic to convert PTS/DTS
                         if (packet.time_base and self._audio_stream.time_base and 
                             packet.time_base.denominator > 0 and 
@@ -709,29 +758,52 @@ class ParticipantRecorder:
                             
                             # Convert PTS
                             if packet.pts is not None:
+                                old_pts = packet.pts
                                 numerator = packet.pts * old_num * new_den
                                 denominator = old_den * new_num
                                 if denominator > 0:
                                     packet.pts = numerator // denominator
+                                    logger.debug(f"Flush audio packet {flush_audio_packet_idx}: PTS {old_pts} -> {packet.pts}")
                                 else:
+                                    logger.warning(f"Flush audio packet {flush_audio_packet_idx}: ❌ Invalid PTS denominator: {denominator}")
                                     packet.pts = 0
                             
                             # Convert DTS
                             if packet.dts is not None:
+                                old_dts = packet.dts
                                 numerator = packet.dts * old_num * new_den
                                 denominator = old_den * new_num
                                 if denominator > 0:
                                     packet.dts = numerator // denominator
+                                    logger.debug(f"Flush audio packet {flush_audio_packet_idx}: DTS {old_dts} -> {packet.dts}")
                                 else:
+                                    logger.warning(f"Flush audio packet {flush_audio_packet_idx}: ❌ Invalid DTS denominator: {denominator}")
                                     packet.dts = 0
+                        else:
+                            logger.warning(
+                                f"Flush audio packet {flush_audio_packet_idx}: ⚠️ Cannot convert - "
+                                f"packet_tb={packet.time_base}, stream_tb={self._audio_stream.time_base}"
+                            )
                         
                         # Set packet time_base to match stream
                         if self._audio_stream.time_base:
                             packet.time_base = self._audio_stream.time_base
+                            logger.debug(f"Flush audio packet {flush_audio_packet_idx}: Timebase set to {packet.time_base}")
                     elif packet.time_base is None:
+                        logger.info(f"Flush audio packet {flush_audio_packet_idx}: ⚠️ No timebase, setting to {self._audio_stream.time_base}")
                         if self._audio_stream.time_base:
                             packet.time_base = self._audio_stream.time_base
-                    self._output_container.mux(packet)
+                    
+                    try:
+                        self._output_container.mux(packet)
+                        logger.debug(f"Flush audio packet {flush_audio_packet_idx}: ✅ Mux successful")
+                    except Exception as e:
+                        logger.critical(
+                            f"Flush audio packet {flush_audio_packet_idx}: ❌ CRITICAL: Mux failed! "
+                            f"pts={packet.pts}, dts={packet.dts}, tb={packet.time_base}, error={e}"
+                        )
+                        raise
+                    flush_audio_packet_idx += 1
             
             logger.info(f"Incremental encoding completed: {video_frame_count} video, {audio_frame_count} audio frames")
             
@@ -878,13 +950,29 @@ class ParticipantRecorder:
         to prevent 0xc0000094 (Divide by Zero) crash in avformat.
         """
         if not self._video_stream or not self._output_container:
+            logger.warning(f"Frame {frame_index}: Missing stream or container - stream={self._video_stream}, container={self._output_container}")
             return
+        
+        # Log stream state
+        if frame_index == 0 or frame_index % 100 == 0:
+            logger.debug(
+                f"Frame {frame_index}: Stream state - "
+                f"stream_tb={self._video_stream.time_base}, "
+                f"fps={self.video_fps}, codec={self.video_codec}"
+            )
         
         # Calculate PTS
         if self._video_stream.time_base:
             time_base_denominator = self._video_stream.time_base.denominator
             time_base_numerator = self._video_stream.time_base.numerator
+            if time_base_denominator == 0 or time_base_numerator == 0:
+                logger.critical(
+                    f"Frame {frame_index}: ❌ CRITICAL: Invalid stream time_base! "
+                    f"num={time_base_numerator}, den={time_base_denominator}"
+                )
+                return
         else:
+            logger.warning(f"Frame {frame_index}: Stream has no time_base, using default 1/1000")
             time_base_denominator = 1000
             time_base_numerator = 1
         
@@ -904,11 +992,18 @@ class ParticipantRecorder:
         
         if pyav_frame and self._video_stream:
             # CRITICAL FIX: Ensure packet time_base matches stream time_base
-            for packet in self._video_stream.encode(pyav_frame):
+            for packet_idx, packet in enumerate(self._video_stream.encode(pyav_frame)):
+                # Log packet details before conversion
+                logger.debug(
+                    f"Frame {frame_index}, Packet {packet_idx}: "
+                    f"pts={packet.pts}, dts={packet.dts}, "
+                    f"packet_tb={packet.time_base}, stream_tb={self._video_stream.time_base}"
+                )
+                
                 # Fix timebase mismatch that causes 0xc0000094 crash
                 if packet.time_base != self._video_stream.time_base:
-                    logger.debug(
-                        f"Frame {frame_index}: Fixing packet time_base mismatch - "
+                    logger.info(
+                        f"Frame {frame_index}, Packet {packet_idx}: ⚠️ Timebase mismatch detected - "
                         f"packet: {packet.time_base}, stream: {self._video_stream.time_base}"
                     )
                     
@@ -925,37 +1020,97 @@ class ParticipantRecorder:
                         new_num = self._video_stream.time_base.numerator
                         new_den = self._video_stream.time_base.denominator
                         
+                        logger.debug(
+                            f"Frame {frame_index}, Packet {packet_idx}: Conversion params - "
+                            f"old_tb={old_num}/{old_den}, new_tb={new_num}/{new_den}"
+                        )
+                        
                         # Convert PTS using integer arithmetic
                         if packet.pts is not None:
+                            old_pts = packet.pts
                             # new_pts = (old_pts * old_num * new_den) / (old_den * new_num)
                             numerator = packet.pts * old_num * new_den
                             denominator = old_den * new_num
                             if denominator > 0:
                                 packet.pts = numerator // denominator
+                                logger.debug(
+                                    f"Frame {frame_index}, Packet {packet_idx}: PTS converted "
+                                    f"{old_pts} -> {packet.pts} "
+                                    f"(num={numerator}, den={denominator})"
+                                )
                             else:
-                                logger.warning(f"Invalid denominator in PTS conversion: {denominator}")
+                                logger.warning(
+                                    f"Frame {frame_index}, Packet {packet_idx}: ❌ Invalid denominator in PTS conversion: {denominator}, "
+                                    f"old_pts={old_pts}, setting to 0"
+                                )
                                 packet.pts = 0
+                        else:
+                            logger.debug(f"Frame {frame_index}, Packet {packet_idx}: PTS is None, skipping conversion")
                         
                         # Convert DTS using integer arithmetic
                         if packet.dts is not None:
+                            old_dts = packet.dts
                             numerator = packet.dts * old_num * new_den
                             denominator = old_den * new_num
                             if denominator > 0:
                                 packet.dts = numerator // denominator
+                                logger.debug(
+                                    f"Frame {frame_index}, Packet {packet_idx}: DTS converted "
+                                    f"{old_dts} -> {packet.dts} "
+                                    f"(num={numerator}, den={denominator})"
+                                )
                             else:
-                                logger.warning(f"Invalid denominator in DTS conversion: {denominator}")
+                                logger.warning(
+                                    f"Frame {frame_index}, Packet {packet_idx}: ❌ Invalid denominator in DTS conversion: {denominator}, "
+                                    f"old_dts={old_dts}, setting to 0"
+                                )
                                 packet.dts = 0
+                        else:
+                            logger.debug(f"Frame {frame_index}, Packet {packet_idx}: DTS is None, skipping conversion")
+                    else:
+                        logger.warning(
+                            f"Frame {frame_index}, Packet {packet_idx}: ⚠️ Cannot convert timebase - "
+                            f"packet_tb={packet.time_base}, stream_tb={self._video_stream.time_base}, "
+                            f"packet_tb_valid={packet.time_base is not None and hasattr(packet.time_base, 'denominator')}, "
+                            f"stream_tb_valid={self._video_stream.time_base is not None and hasattr(self._video_stream.time_base, 'denominator')}"
+                        )
                     
                     # Set packet time_base to match stream
                     if self._video_stream.time_base:
+                        old_tb = packet.time_base
                         packet.time_base = self._video_stream.time_base
+                        logger.debug(
+                            f"Frame {frame_index}, Packet {packet_idx}: Timebase set "
+                            f"{old_tb} -> {packet.time_base}"
+                        )
                 elif packet.time_base is None:
                     # If packet has no time_base, set it to stream's time_base
-                    logger.debug(f"Frame {frame_index}: Packet has no time_base, setting to stream time_base")
+                    logger.info(
+                        f"Frame {frame_index}, Packet {packet_idx}: ⚠️ Packet has no time_base, "
+                        f"setting to stream time_base: {self._video_stream.time_base}"
+                    )
                     if self._video_stream.time_base:
                         packet.time_base = self._video_stream.time_base
+                else:
+                    logger.debug(
+                        f"Frame {frame_index}, Packet {packet_idx}: ✅ Timebases match: {packet.time_base}"
+                    )
                 
-                self._output_container.mux(packet)
+                # Log before muxing
+                logger.debug(
+                    f"Frame {frame_index}, Packet {packet_idx}: Muxing packet - "
+                    f"pts={packet.pts}, dts={packet.dts}, tb={packet.time_base}"
+                )
+                
+                try:
+                    self._output_container.mux(packet)
+                    logger.debug(f"Frame {frame_index}, Packet {packet_idx}: ✅ Mux successful")
+                except Exception as e:
+                    logger.critical(
+                        f"Frame {frame_index}, Packet {packet_idx}: ❌ CRITICAL: Mux failed! "
+                        f"pts={packet.pts}, dts={packet.dts}, tb={packet.time_base}, error={e}"
+                    )
+                    raise
         
         # Release frame reference immediately
         del pyav_frame
