@@ -547,17 +547,15 @@ class ParticipantRecorder:
                                 self._video_stream.options = encoding_options
                                 logger.info(f"Video encoding: {video_width}x{video_height} @ {actual_bitrate/1_000_000:.2f} Mbps, quality={self.video_quality}")
                                 
-                                # FORCE time_base to 1/1000 (standard for WebM)
-                                # This simplifies PTS calculation (milliseconds) and ensures compatibility
-                                self._video_stream.time_base = Fraction(1, 1000)
-                                
-                                # Force codec context time_base as well to align encoder
-                                self._video_stream.codec_context.time_base = Fraction(1, 1000)
+                                # CRITICAL: Allow PyAV to determine best time_base (likely 1/FPS)
+                                # We will convert to 1/1000 ONLY if the container specifically demands it during muxing
+                                # This prevents fighting the encoder's native timebase
+                                # self._video_stream.time_base = Fraction(1, 1000)
                                 
                                 if self._video_stream.time_base:
                                     logger.info(f"Stream time_base set to: {self._video_stream.time_base}")
                                 else:
-                                    logger.warning("Stream time_base is None after add_stream")
+                                    logger.warning("Stream time_base is None after add_stream - will auto-align")
 
                                 self._video_stream_initialized = True
                                 logger.info(
@@ -967,7 +965,6 @@ class ParticipantRecorder:
         # But we track it in 1/FPS units to keep logic clean
         
         encoder_fps = self.video_fps if self.video_fps > 0 else 30
-        # time_base_denominator/numerator are no longer used here as we use encoder_fps directly
         
         if self._first_video_frame_time is not None:
             time_since_first_us = frame_event.timestamp_us - self._first_video_frame_time
@@ -987,8 +984,9 @@ class ParticipantRecorder:
         frame = frame_event.frame
         pyav_frame = self._convert_video_frame_to_pyav(frame, self._video_stream, pts)
         
-        # DO NOT set pyav_frame.time_base manually. 
-        # The encoder generally ignores it or uses it only if stream.time_base is not set.
+        # Explicitly set time_base on the frame so the encoder knows these are frame indices (1/30), not ms
+        if pyav_frame:
+             pyav_frame.time_base = Fraction(1, encoder_fps)
         
         if pyav_frame and self._video_stream:
             # CRITICAL FIX: Ensure packet time_base matches stream time_base
