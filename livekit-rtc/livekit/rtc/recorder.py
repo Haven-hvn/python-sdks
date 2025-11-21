@@ -799,53 +799,92 @@ class ParticipantRecorder:
         return options
 
     def _encode_video_frame_incremental_sync(self, frame_event: VideoFrameEvent, frame_index: int) -> None:
-        """Encode a single video frame incrementally (synchronous)."""
+        """Encode a single video frame incrementally (synchronous) with DEBUG logging."""
+        
+        # [DEBUG] Trace entry
+        logger.info(f"DEBUG: Entering _encode for frame {frame_index}")
+
         if not self._video_stream or not self._output_container:
+            logger.warning("DEBUG: Stream or container is None")
             return
         
-        # Calculate PTS based on actual frame timestamps (not frame index)
-        # This ensures correct duration regardless of actual frame rate
+        # [DEBUG] Inspect Stream Timebase
+        tb = self._video_stream.time_base
+        if tb:
+            logger.info(f"DEBUG: Stream time_base: {tb.numerator}/{tb.denominator}")
+            if tb.numerator == 0 or tb.denominator == 0:
+                logger.critical("❌ CRITICAL: Stream time_base has ZERO component!")
+        else:
+            logger.info("DEBUG: Stream time_base is None! (Setting default 1/1000)")
+        
+        # [DEBUG] Inspect Container Timebase (if accessible)
+        # Some PyAV versions expose it on the container or stream context
+        try:
+            logger.info(f"DEBUG: Stream ID: {self._video_stream.index}, codec: {self._video_stream.name}")
+        except Exception as e:
+            logger.warning(f"DEBUG: Could not inspect stream details: {e}")
+
+        # Calculate PTS
         if self._video_stream.time_base:
             time_base_denominator = self._video_stream.time_base.denominator
             time_base_numerator = self._video_stream.time_base.numerator
-
-            # [NEW] Check for zero values
-            if time_base_numerator == 0 or self.video_fps == 0:
-                logger.critical(
-                    f"❌ Zero value detected! time_base={time_base_numerator}/{time_base_denominator}, fps={self.video_fps}. "
-                    f"This will cause DivByZero crash."
-                )
-                return # Skip this frame safely
         else:
             time_base_denominator = 1000
             time_base_numerator = 1
         
-        # Use actual timestamp from frame event to calculate PTS
-        # timestamp_us is in microseconds, convert to PTS units
         if self._first_video_frame_time is not None:
-            # Calculate time since first frame in seconds
             time_since_first_sec = (frame_event.timestamp_us - self._first_video_frame_time) / 1_000_000.0
-            # Convert to PTS units: (time_sec * time_base_denominator) / time_base_numerator
-            # Since time_base = 1/1000, PTS = time_ms = time_sec * 1000
             pts = int(time_since_first_sec * time_base_denominator / time_base_numerator)
+            logger.info(f"DEBUG: PTS calc: {pts} (time: {time_since_first_sec:.4f}s)")
         else:
-            # Fallback to frame index if first timestamp not set (shouldn't happen)
+            # Fallback
             frame_interval = int(time_base_denominator / (self.video_fps * time_base_numerator))
-            if frame_interval < 1:
-                frame_interval = 1
+            if frame_interval < 1: frame_interval = 1
             pts = frame_index * frame_interval
+            logger.info(f"DEBUG: PTS fallback: {pts}")
         
-        # Convert and encode frame
+        # Convert Frame
+        logger.info("DEBUG: Converting frame to PyAV...")
         frame = frame_event.frame
         pyav_frame = self._convert_video_frame_to_pyav(frame, self._video_stream, pts)
+        
         if pyav_frame and self._video_stream:
-            for packet in self._video_stream.encode(pyav_frame):
-                self._output_container.mux(packet)
+            # [DEBUG] Inspect PyAV Frame
+            logger.info(
+                f"DEBUG: PyAV Frame ready. "
+                f"PTS: {pyav_frame.pts}, "
+                f"TimeBase: {pyav_frame.time_base}, "
+                f"Size: {pyav_frame.width}x{pyav_frame.height}, "
+                f"Fmt: {pyav_frame.format.name}"
+            )
+
+            try:
+                # [DEBUG] Encode
+                logger.info("DEBUG: Calling stream.encode()...")
+                packets = self._video_stream.encode(pyav_frame)
+                logger.info(f"DEBUG: stream.encode() returned generator/list")
+
+                # [DEBUG] Mux Loop
+                for i, packet in enumerate(packets):
+                    ptb = packet.time_base
+                    logger.info(
+                        f"DEBUG: Packet {i} -> "
+                        f"pts={packet.pts}, dts={packet.dts}, "
+                        f"tb={ptb.numerator}/{ptb.denominator} if ptb else None, "
+                        f"stream_index={packet.stream.index}"
+                    )
+                    
+                    logger.info("DEBUG: Calling output_container.mux(packet)...")
+                    self._output_container.mux(packet)
+                    logger.info("DEBUG: mux() success")
+
+            except Exception as e:
+                logger.critical(f"❌ CRITICAL: Crash inside encode/mux loop: {e}")
+                raise
+        else:
+            logger.warning("DEBUG: pyav_frame conversion returned None")
         
-        # Release frame reference immediately
-        del pyav_frame
-        
-        # Periodic GC (every 50 frames)
+        # Periodic GC
         if frame_index > 0 and frame_index % 50 == 0:
             gc.collect()
 
