@@ -546,8 +546,16 @@ class ParticipantRecorder:
                                 encoding_options = self._get_video_encoding_options(actual_bitrate)
                                 self._video_stream.options = encoding_options
                                 logger.info(f"Video encoding: {video_width}x{video_height} @ {actual_bitrate/1_000_000:.2f} Mbps, quality={self.video_quality}")
-                                # Set time_base for video (1/1000 for milliseconds-based timing)
-                                self._video_stream.time_base = Fraction(1, 1000)
+                                
+                                # CRITICAL CHANGE: Do NOT force time_base to 1/1000. 
+                                # Let PyAV/FFmpeg match the encoder's timebase (e.g. 1/30) to avoid mismatch crashes.
+                                # self._video_stream.time_base = Fraction(1, 1000)
+                                
+                                if self._video_stream.time_base:
+                                    logger.info(f"Stream time_base auto-set to: {self._video_stream.time_base}")
+                                else:
+                                    logger.warning("Stream time_base is None after add_stream - will be determined by encoder")
+
                                 self._video_stream_initialized = True
                                 logger.info(
                                     f"✅ Initialized video stream: {video_width}x{video_height}, "
@@ -962,8 +970,11 @@ class ParticipantRecorder:
                 )
                 return
         else:
-            logger.warning(f"Frame {frame_index}: Stream has no time_base, using default 1/1000")
-            time_base_denominator = 1000
+            # Fallback if time_base not set yet: assume 1/FPS (standard for video)
+            # This is safer than 1/1000 as it likely matches what the encoder will choose
+            fps = self.video_fps if self.video_fps > 0 else 30
+            logger.warning(f"Frame {frame_index}: Stream has no time_base, assuming 1/{fps}")
+            time_base_denominator = fps
             time_base_numerator = 1
         
         if self._first_video_frame_time is not None:
