@@ -697,7 +697,7 @@ class ParticipantRecorder:
                     # CRITICAL FIX: Ensure packet time_base matches stream time_base before muxing
                     # This prevents 0xc0000094 (Divide by Zero) crash in avformat
                     if packet.time_base != self._video_stream.time_base:
-                        logger.info(
+                        logger.debug(
                             f"Flush video packet {flush_packet_idx}: ⚠️ Timebase mismatch - "
                             f"packet: {packet.time_base}, stream: {self._video_stream.time_base}. Rescaling..."
                         )
@@ -759,7 +759,7 @@ class ParticipantRecorder:
                     
                     # Same fix for audio packets
                     if packet.time_base != self._audio_stream.time_base:
-                        logger.info(
+                        logger.debug(
                             f"Flush audio packet {flush_audio_packet_idx}: ⚠️ Timebase mismatch - "
                             f"packet: {packet.time_base}, stream: {self._audio_stream.time_base}. Rescaling..."
                         )
@@ -1010,7 +1010,7 @@ class ParticipantRecorder:
             # PTS = index * (1/30) * (den / num)
             pts = (frame_index * time_base_denominator) // (30 * time_base_numerator)
         
-        logger.info(f"Calculated PTS: {pts} for frame {frame_index} (stream_tb={stream_time_base})")
+        logger.debug(f"Calculated PTS: {pts} for frame {frame_index} (stream_tb={stream_time_base})")
         self._last_video_pts = pts
         
         # Convert and encode frame
