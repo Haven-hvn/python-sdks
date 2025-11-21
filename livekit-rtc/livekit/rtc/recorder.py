@@ -164,7 +164,8 @@ class ParticipantRecorder:
         # Audio frames arrive at ~100fps (every ~10ms), so 30 seconds = 3000 frames
         max_audio_queue_size = max(1000, video_fps * 100)  # ~30 seconds at typical audio frame rate
         
-        self._video_queue: asyncio.Queue[VideoFrameEvent] = asyncio.Queue(maxsize=max_video_queue_size)
+        # Store (event, capture_time) tuples to track wall-clock arrival time
+        self._video_queue: asyncio.Queue[tuple[VideoFrameEvent, float]] = asyncio.Queue(maxsize=max_video_queue_size)
         self._audio_queue: asyncio.Queue[AudioFrameEvent] = asyncio.Queue(maxsize=max_audio_queue_size)
 
         # Background tasks for capturing frames
@@ -389,7 +390,8 @@ class ParticipantRecorder:
                 
                 # Put frame in queue, waiting if necessary
                 # The bounded queue size limits memory growth while allowing backpressure
-                await self._video_queue.put(frame_event)
+                # We store capture time to ensure PTS matches wall clock time
+                await self._video_queue.put((frame_event, time.time()))
                 frame_count += 1
                 self._stats.video_frames_recorded += 1
                 if frame_count % 100 == 0:
@@ -482,9 +484,10 @@ class ParticipantRecorder:
                         if self._is_recording:
                             try:
                                 logger.debug(f"Waiting for video frame. Queue size: {self._video_queue.qsize()}, Recording: {self._is_recording}")
-                                frame_event = await asyncio.wait_for(
+                                frame_data = await asyncio.wait_for(
                                     self._video_queue.get(), timeout=0.1
                                 )
+                                frame_event, capture_time = frame_data
                                 frames_processed = True
                                 logger.debug(f"Received video frame {video_frame_count + 1}")
                             except asyncio.TimeoutError:
@@ -495,9 +498,10 @@ class ParticipantRecorder:
                             queue_size = self._video_queue.qsize()
                             logger.debug(f"Recording stopped. Processing remaining video frames. Queue size: {queue_size}")
                             try:
-                                frame_event = await asyncio.wait_for(
+                                frame_data = await asyncio.wait_for(
                                     self._video_queue.get(), timeout=1.0
                                 )
+                                frame_event, capture_time = frame_data
                                 frames_processed = True
                                 logger.debug(f"Processed remaining video frame {video_frame_count + 1}")
                             except (asyncio.TimeoutError, asyncio.QueueEmpty):
@@ -570,7 +574,7 @@ class ParticipantRecorder:
                                 raise
                         
                         # Encode video frame
-                        await self._encode_video_frame_incremental(frame_event, video_frame_count)
+                        await self._encode_video_frame_incremental(frame_event, video_frame_count, capture_time)
                         video_frame_count += 1
                         
                         # Release frame reference immediately after encoding
@@ -942,7 +946,7 @@ class ParticipantRecorder:
         
         return options
 
-    def _encode_video_frame_incremental_sync(self, frame_event: VideoFrameEvent, frame_index: int) -> None:
+    def _encode_video_frame_incremental_sync(self, frame_event: VideoFrameEvent, frame_index: int, capture_time: float) -> None:
         """Encode a single video frame incrementally (synchronous) with timebase fix.
         
         CRITICAL FIX: Ensures packet time_base matches stream time_base before muxing
@@ -975,12 +979,26 @@ class ParticipantRecorder:
         else:
             logger.warning("Stream timebase missing for PTS calc, using 1/1000")
 
-        if self._first_video_frame_time is not None:
-            time_since_first_us = frame_event.timestamp_us - self._first_video_frame_time
-            # Calculate PTS in stream timebase units
-            # PTS = (us / 1_000_000) * (den / num)
-            pts = (time_since_first_us * time_base_denominator) // (1_000_000 * time_base_numerator)
+        # Use wall clock capture time for PTS to ensure sync with real-time recording
+        # capture_time is system time.time() when frame was captured
+        # start_time is system time.time() when recording started
+        if self._start_time is not None:
+            time_since_start_s = capture_time - self._start_time
+            # Ensure non-negative
+            if time_since_start_s < 0:
+                 time_since_start_s = 0
             
+            # Calculate PTS in stream timebase units
+            # PTS = seconds * (den / num)
+            pts = int(time_since_start_s * time_base_denominator / time_base_numerator)
+            
+            # Log drift between SDK timestamp and wall clock
+            if self._first_video_frame_time is not None:
+                sdk_duration = (frame_event.timestamp_us - self._first_video_frame_time) / 1_000_000
+                drift = time_since_start_s - sdk_duration
+                if abs(drift) > 0.1:  # Log significant drift
+                    logger.debug(f"Frame {frame_index}: Time drift - Wall: {time_since_start_s:.3f}s, SDK: {sdk_duration:.3f}s, Drift: {drift:.3f}s")
+
             # Enforce strictly monotonic increasing timestamps
             if pts <= self._last_video_pts:
                  pts = self._last_video_pts + 1
@@ -1098,11 +1116,11 @@ class ParticipantRecorder:
         if frame_index > 0 and frame_index % 50 == 0:
             gc.collect()
 
-    async def _encode_video_frame_incremental(self, frame_event: VideoFrameEvent, frame_index: int) -> None:
+    async def _encode_video_frame_incremental(self, frame_event: VideoFrameEvent, frame_index: int, capture_time: float) -> None:
         """Encode a single video frame incrementally."""
         # Encoding is fast enough that we can do it directly in async context
         # PyAV encode operations are typically < 10ms per frame
-        self._encode_video_frame_incremental_sync(frame_event, frame_index)
+        self._encode_video_frame_incremental_sync(frame_event, frame_index, capture_time)
 
     def _encode_audio_frame_incremental_sync(self, frame_event: AudioFrameEvent) -> None:
         """Encode a single audio frame incrementally (synchronous)."""
