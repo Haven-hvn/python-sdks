@@ -547,15 +547,14 @@ class ParticipantRecorder:
                                 self._video_stream.options = encoding_options
                                 logger.info(f"Video encoding: {video_width}x{video_height} @ {actual_bitrate/1_000_000:.2f} Mbps, quality={self.video_quality}")
                                 
-                                # CRITICAL: Allow PyAV to determine best time_base (likely 1/FPS)
-                                # We will convert to 1/1000 ONLY if the container specifically demands it during muxing
-                                # This prevents fighting the encoder's native timebase
-                                # self._video_stream.time_base = Fraction(1, 1000)
+                                # CRITICAL: Force time_base to 1/1000 (standard for WebM)
+                                # This is the only robust way to ensure containers like WebM interpret timestamps as milliseconds.
+                                self._video_stream.time_base = Fraction(1, 1000)
                                 
                                 if self._video_stream.time_base:
                                     logger.info(f"Stream time_base set to: {self._video_stream.time_base}")
                                 else:
-                                    logger.warning("Stream time_base is None after add_stream - will auto-align")
+                                    logger.warning("Stream time_base is None after add_stream")
 
                                 self._video_stream_initialized = True
                                 logger.info(
@@ -961,22 +960,23 @@ class ParticipantRecorder:
             )
         
         # Calculate PTS
-        # We use encoder's expected timebase (1/FPS) for PTS calculation to prevent duration inflation
-        # But we track it in 1/FPS units to keep logic clean
+        # We calculate PTS in milliseconds (1/1000) to match the forced stream timebase.
+        # We MUST also set pyav_frame.time_base = 1/1000 so the encoder knows these are ms, not frames.
         
-        encoder_fps = self.video_fps if self.video_fps > 0 else 30
+        time_base_denominator = 1000
+        time_base_numerator = 1
         
         if self._first_video_frame_time is not None:
             time_since_first_us = frame_event.timestamp_us - self._first_video_frame_time
-            # Calculate PTS in 1/FPS units (frames)
-            # PTS = (us / 1_000_000) * FPS
-            pts = int((time_since_first_us / 1_000_000.0) * encoder_fps)
+            # Calculate PTS in milliseconds
+            pts = int(time_since_first_us / 1000)
             
             # Enforce strictly monotonic increasing timestamps
             if pts <= self._last_video_pts:
                  pts = self._last_video_pts + 1
         else:
-            pts = frame_index  # Simple frame count if no time reference
+            # Fallback if no timestamps: assume 30fps (33ms per frame)
+            pts = frame_index * 33
         
         self._last_video_pts = pts
         
@@ -984,9 +984,11 @@ class ParticipantRecorder:
         frame = frame_event.frame
         pyav_frame = self._convert_video_frame_to_pyav(frame, self._video_stream, pts)
         
-        # Explicitly set time_base on the frame so the encoder knows these are frame indices (1/30), not ms
+        # CRITICAL: Tell the encoder that our PTS values are in 1/1000 units (milliseconds)
+        # If we don't set this, the encoder might assume 1/FPS (e.g. 1/30) and interpret
+        # "1000" as "1000 frames" (33 seconds) instead of "1 second", causing massive duration inflation.
         if pyav_frame:
-             pyav_frame.time_base = Fraction(1, encoder_fps)
+             pyav_frame.time_base = Fraction(1, 1000)
         
         if pyav_frame and self._video_stream:
             # CRITICAL FIX: Ensure packet time_base matches stream time_base
