@@ -960,40 +960,54 @@ class ParticipantRecorder:
             )
         
         # Calculate PTS
-        if self._video_stream.time_base:
-            time_base_denominator = self._video_stream.time_base.denominator
-            time_base_numerator = self._video_stream.time_base.numerator
-            if time_base_denominator == 0 or time_base_numerator == 0:
-                logger.critical(
-                    f"Frame {frame_index}: ❌ CRITICAL: Invalid stream time_base! "
-                    f"num={time_base_numerator}, den={time_base_denominator}"
-                )
-                return
-        else:
-            # Fallback if time_base not set yet: assume 1/FPS (standard for video)
-            # This is safer than 1/1000 as it likely matches what the encoder will choose
-            fps = self.video_fps if self.video_fps > 0 else 30
-            logger.warning(f"Frame {frame_index}: Stream has no time_base, assuming 1/{fps}")
-            time_base_denominator = fps
-            time_base_numerator = 1
+        # We ignore the stream's timebase here because we must feed the encoder 
+        # timestamps in its expected format (1/FPS), otherwise it interprets milliseconds as frames.
+        # Rescaling to stream timebase happens AFTER encoding.
         
-        if self._first_video_frame_time is not None:
-            # Use wall-clock time for PTS to handle variable network arrival rates
-            # This ensures audio/video sync even if frames arrive irregularly
-            time_since_first_us = frame_event.timestamp_us - self._first_video_frame_time
-            pts = (time_since_first_us * time_base_denominator) // (1_000_000 * time_base_numerator)
+        # if self._video_stream.time_base:
+        #     time_base_denominator = self._video_stream.time_base.denominator
+        #     time_base_numerator = self._video_stream.time_base.numerator
+        #     if time_base_denominator == 0 or time_base_numerator == 0:
+        #         logger.critical(
+        #             f"Frame {frame_index}: ❌ CRITICAL: Invalid stream time_base! "
+        #             f"num={time_base_numerator}, den={time_base_denominator}"
+        #         )
+        #         return
+        # else:
+        #     # Fallback if time_base not set yet: assume 1/FPS (standard for video)
+        #     # This is safer than 1/1000 as it likely matches what the encoder will choose
+        #     fps = self.video_fps if self.video_fps > 0 else 30
+        #     logger.warning(f"Frame {frame_index}: Stream has no time_base, assuming 1/{fps}")
+        #     time_base_denominator = fps
+        #     time_base_numerator = 1
+        
+        # Use encoder's expected timebase (1/FPS) for PTS calculation
+            # This prevents the encoder from interpreting milliseconds (1/1000) as frames (1/30)
+            # creating massive duration inflation.
+            encoder_fps = self.video_fps if self.video_fps > 0 else 30
+            encoder_time_base = Fraction(1, encoder_fps)
             
-            # Enforce strictly monotonic increasing timestamps
-            if pts <= self._last_video_pts:
-                 pts = self._last_video_pts + 1
-        else:
-            pts = frame_index
-        
-        self._last_video_pts = pts
-        
-        # Convert and encode frame
-        frame = frame_event.frame
-        pyav_frame = self._convert_video_frame_to_pyav(frame, self._video_stream, pts)
+            if self._first_video_frame_time is not None:
+                time_since_first_us = frame_event.timestamp_us - self._first_video_frame_time
+                # PTS = seconds * fps
+                pts = int((time_since_first_us / 1_000_000.0) * encoder_fps)
+                
+                # Enforce strictly monotonic increasing timestamps
+                if pts <= self._last_video_pts:
+                     pts = self._last_video_pts + 1
+            else:
+                pts = frame_index
+            
+            self._last_video_pts = pts
+            
+            # Convert and encode frame
+            frame = frame_event.frame
+            pyav_frame = self._convert_video_frame_to_pyav(frame, self._video_stream, pts)
+            
+            # Explicitly set the frame timebase to match our PTS calculation (1/FPS)
+            # ensuring the encoder interprets the timestamp correctly
+            if pyav_frame:
+                pyav_frame.time_base = encoder_time_base
         
         if pyav_frame and self._video_stream:
             # CRITICAL FIX: Ensure packet time_base matches stream time_base
