@@ -1266,9 +1266,14 @@ class ParticipantRecorder:
                 threshold = 30 * time_base_denominator // time_base_numerator
                 pts_diff = audio_pts - self._last_audio_pts
                 
-                if pts_diff < -threshold or pts_diff > threshold:
-                    logger.warning(f"Audio PTS gap detected ({self._last_audio_pts} -> {audio_pts}). Resetting monotonicity.")
-                    self._last_audio_pts = audio_pts - 1
+                if pts_diff > threshold:
+                     # Allow large forward jumps (silence gap), but log it
+                     logger.warning(f"Audio PTS gap detected ({self._last_audio_pts} -> {audio_pts}). Allowing forward jump.")
+                elif pts_diff < -threshold:
+                     # Large backward jump - suspicious. But we cannot reset Muxer.
+                     # We must clamp to last_pts + 1 to maintain monotonicity.
+                     logger.warning(f"Audio PTS backward jump detected ({self._last_audio_pts} -> {audio_pts}). Clamping to monotonic.")
+                     # Do NOT reset self._last_audio_pts to a lower value, as Muxer will reject it.
 
             if audio_pts <= self._last_audio_pts:
                 old_pts = audio_pts
@@ -1291,7 +1296,7 @@ class ParticipantRecorder:
                     if packet.time_base != target_time_base:
                         logger.debug(
                             f"Audio Frame, Packet {packet_idx}: ⚠️ Timebase mismatch - "
-                            f"packet: {packet.time_base}, stream: {self._audio_stream.time_base} (target: {target_time_base})"
+                            f"packet: {packet.time_base}, stream: {self._audio_stream.time_base} (target: {target_time_base}). Checking for inflation..."
                         )
                         
                         try:
@@ -1307,20 +1312,45 @@ class ParticipantRecorder:
                                 new_num = target_time_base.numerator
                                 new_den = target_time_base.denominator
                                 
+                                # Calculate rescaled PTS
+                                rescaled_pts = packet.pts
                                 if packet.pts is not None:
-                                    packet.pts = (packet.pts * old_num * new_den) // (old_den * new_num)
+                                    rescaled_pts = (packet.pts * old_num * new_den) // (old_den * new_num)
                                 
-                                if packet.dts is not None:
-                                    packet.dts = (packet.dts * old_num * new_den) // (old_den * new_num)
+                                # Heuristic for audio inflation/deflation
+                                use_raw = False
+                                if self._last_audio_pts != -1 and packet.pts is not None:
+                                    diff_rescaled = abs(rescaled_pts - self._last_audio_pts)
+                                    diff_raw = abs(packet.pts - self._last_audio_pts)
                                     
-                                if packet.duration:
-                                    packet.duration = (packet.duration * old_num * new_den) // (old_den * new_num)
+                                    # 30 seconds threshold in target units (approx 48000 * 30)
+                                    threshold = 30 * target_time_base.denominator // target_time_base.numerator
+                                    
+                                    if diff_rescaled > threshold and diff_raw < threshold / 6: # < 5s
+                                        use_raw = True
+                                        logger.warning(
+                                            f"Audio Frame, Packet {packet_idx}: Detected phantom timebase! "
+                                            f"Raw PTS {packet.pts} is close to last {self._last_audio_pts}, "
+                                            f"but rescaled {rescaled_pts} is huge. Using raw values."
+                                        )
+
+                                if use_raw:
+                                    pass
+                                else:
+                                    if packet.pts is not None:
+                                        packet.pts = rescaled_pts
+                                    
+                                    if packet.dts is not None:
+                                        packet.dts = (packet.dts * old_num * new_den) // (old_den * new_num)
+                                        
+                                    if packet.duration:
+                                        packet.duration = (packet.duration * old_num * new_den) // (old_den * new_num)
                                     
                                 packet.time_base = target_time_base
                                 if self._audio_stream.time_base is None:
                                      self._audio_stream.time_base = target_time_base
                                      
-                                logger.debug(f"Audio Frame, Packet {packet_idx}: Manually converted packet - pts={packet.pts}, dts={packet.dts}, dur={packet.duration}, tb={packet.time_base}")
+                                logger.debug(f"Audio Frame, Packet {packet_idx}: Converted packet - pts={packet.pts}, dts={packet.dts}, dur={packet.duration}, tb={packet.time_base}")
                             else:
                                 logger.warning(f"Audio Frame, Packet {packet_idx}: Invalid timebase for manual conversion. packet_tb={packet.time_base}, target_tb={target_time_base}")
                         except Exception as e:
