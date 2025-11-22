@@ -48,27 +48,32 @@ logger = logging.getLogger(__name__)
 
 class RecordingError(Exception):
     """Base exception for recording-related errors."""
+
     pass
 
 
 class ParticipantNotFoundError(RecordingError):
     """Raised when a participant is not found in the room."""
+
     pass
 
 
 class TrackNotFoundError(RecordingError):
     """Raised when a track is not found or not available."""
+
     pass
 
 
 class WebMEncoderNotAvailableError(RecordingError):
     """Raised when WebM encoding libraries are not available."""
+
     pass
 
 
 @dataclass
 class RecordingStats:
     """Statistics for a recording session."""
+
     video_frames_recorded: int = 0
     audio_frames_recorded: int = 0
     recording_duration_seconds: float = 0.0
@@ -164,9 +169,8 @@ class ParticipantRecorder:
         # Audio frames arrive at ~100fps (every ~10ms), so 30 seconds = 3000 frames
         max_audio_queue_size = max(1000, video_fps * 100)  # ~30 seconds at typical audio frame rate
         
-        # Store (event, capture_time) tuples to track wall-clock arrival time
-        self._video_queue: asyncio.Queue[tuple[VideoFrameEvent, float]] = asyncio.Queue(maxsize=max_video_queue_size)
-        self._audio_queue: asyncio.Queue[tuple[AudioFrameEvent, float]] = asyncio.Queue(maxsize=max_audio_queue_size)
+        self._video_queue: asyncio.Queue[VideoFrameEvent] = asyncio.Queue(maxsize=max_video_queue_size)
+        self._audio_queue: asyncio.Queue[AudioFrameEvent] = asyncio.Queue(maxsize=max_audio_queue_size)
 
         # Background tasks for capturing frames
         self._video_capture_task: Optional[asyncio.Task[None]] = None
@@ -184,8 +188,10 @@ class ParticipantRecorder:
         self._cumulative_audio_samples: int = 0
         self._first_video_frame_time: Optional[float] = None
         self._video_frame_count: int = 0
-        self._last_video_pts: int = -1  # For monotonic PTS enforcement
-        self._last_audio_pts: int = -1  # For monotonic PTS enforcement for audio
+
+        # Monotonicity enforcement
+        self._last_video_dts: int = -1
+        self._last_audio_dts: int = -1
 
         # Synchronization
         self._lock = asyncio.Lock()
@@ -228,21 +234,8 @@ class ParticipantRecorder:
             self._first_video_frame_time = None
             self._cumulative_audio_samples = 0
             self._video_frame_count = 0
-            self._last_video_pts = -1  # Reset monotonic PTS tracker
-            self._last_audio_pts = -1  # Reset monotonic PTS tracker for audio
-
-            # Clear queues to prevent stale frames from previous sessions
-            while not self._video_queue.empty():
-                try:
-                    self._video_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-            
-            while not self._audio_queue.empty():
-                try:
-                    self._audio_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+            self._last_video_dts = -1
+            self._last_audio_dts = -1
 
             # Subscribe to all published tracks
             await self._subscribe_to_participant_tracks(participant)
@@ -393,32 +386,20 @@ class ParticipantRecorder:
         try:
             first_frame = True
             frame_count = 0
-            
-            # Log that we are entering the loop
-            logger.info(f"Video capture loop running for participant {self._participant_identity}")
-            
             async for frame_event in self._video_capture_stream:
                 if not self._is_recording:
                     logger.debug(f"Recording stopped, breaking video capture loop. Captured {frame_count} frames")
                     break
                 # Store first frame timestamp as reference for synchronization
-                if first_frame:
-                    if self._start_time:
-                        # Convert start_time (seconds) to microseconds for consistency
-                        self._recording_start_time_us = int(self._start_time * 1_000_000)
+                if first_frame and self._start_time:
+                    # Convert start_time (seconds) to microseconds for consistency
+                    self._recording_start_time_us = int(self._start_time * 1_000_000)
                     first_frame = False
                     logger.debug(f"Captured first video frame. Queue size before put: {self._video_queue.qsize()}")
                 
                 # Put frame in queue, waiting if necessary
                 # The bounded queue size limits memory growth while allowing backpressure
-                # We store capture time to ensure PTS matches wall clock time
-                try:
-                    # Use timeout to detect if consumer is stuck
-                    await asyncio.wait_for(self._video_queue.put((frame_event, time.time())), timeout=1.0)
-                except asyncio.TimeoutError:
-                     logger.warning(f"Video queue full/blocked for 1.0s! Dropping frame {frame_count}. Consumer might be stuck.")
-                     continue
-                
+                await self._video_queue.put(frame_event)
                 frame_count += 1
                 self._stats.video_frames_recorded += 1
                 if frame_count % 100 == 0:
@@ -440,10 +421,6 @@ class ParticipantRecorder:
         try:
             first_frame = True
             frame_count = 0
-            
-            # Log that we are entering the loop
-            logger.info(f"Audio capture loop running for participant {self._participant_identity}")
-            
             async for frame_event in self._audio_capture_stream:
                 if not self._is_recording:
                     logger.debug(f"Recording stopped, breaking audio capture loop. Captured {frame_count} frames")
@@ -455,13 +432,7 @@ class ParticipantRecorder:
                 
                 # Put frame in queue, waiting if necessary
                 # The bounded queue size limits memory growth while allowing backpressure
-                try:
-                     # Use timeout to detect if consumer is stuck
-                    await asyncio.wait_for(self._audio_queue.put((frame_event, time.time())), timeout=1.0)
-                except asyncio.TimeoutError:
-                     logger.warning(f"Audio queue full/blocked for 1.0s! Dropping frame {frame_count}. Consumer might be stuck.")
-                     continue
-                     
+                await self._audio_queue.put(frame_event)
                 frame_count += 1
                 self._stats.audio_frames_recorded += 1
                 if frame_count % 500 == 0:
@@ -491,6 +462,7 @@ class ParticipantRecorder:
         container_init_lock = asyncio.Lock()
         
         try:
+            
             # Process frames from queues as they arrive
             video_frame_count = 0
             audio_frame_count = 0
@@ -503,28 +475,14 @@ class ParticipantRecorder:
                 frames_processed = False
                 logger.debug("Video frame processing task started")
                 while self._is_recording or not self._video_queue.empty():
-                    # Debug log every 50 frames
-                    if video_frame_count % 50 == 0:
-                        try:
-                            import psutil, os
-                            process = psutil.Process(os.getpid())
-                            mem = process.memory_info().rss / 1024 / 1024
-                            logger.debug(
-                                f"🎥 Video Loop | Frame: {video_frame_count} | "
-                                f"Queue: {self._video_queue.qsize()} | Mem: {mem:.1f}MB"
-                            )
-                        except ImportError:
-                            pass
-
                     try:
                         # Wait for frame with timeout to check recording status periodically
                         if self._is_recording:
                             try:
                                 logger.debug(f"Waiting for video frame. Queue size: {self._video_queue.qsize()}, Recording: {self._is_recording}")
-                                frame_data = await asyncio.wait_for(
+                                frame_event = await asyncio.wait_for(
                                     self._video_queue.get(), timeout=0.1
                                 )
-                                frame_event, capture_time = frame_data
                                 frames_processed = True
                                 logger.debug(f"Received video frame {video_frame_count + 1}")
                             except asyncio.TimeoutError:
@@ -535,10 +493,9 @@ class ParticipantRecorder:
                             queue_size = self._video_queue.qsize()
                             logger.debug(f"Recording stopped. Processing remaining video frames. Queue size: {queue_size}")
                             try:
-                                frame_data = await asyncio.wait_for(
+                                frame_event = await asyncio.wait_for(
                                     self._video_queue.get(), timeout=1.0
                                 )
-                                frame_event, capture_time = frame_data
                                 frames_processed = True
                                 logger.debug(f"Processed remaining video frame {video_frame_count + 1}")
                             except (asyncio.TimeoutError, asyncio.QueueEmpty):
@@ -561,58 +518,31 @@ class ParticipantRecorder:
                             video_width = frame.width
                             video_height = frame.height
                             
-                            # Log exact parameters before stream creation
-                            logger.info(
-                                f"Attempting to add_stream: codec={self.video_codec}, "
-                                f"rate={self.video_fps}, width={video_width}, height={video_height}, "
-                                f"auto_bitrate={self.auto_bitrate}"
-                            )
-                            
                             # Store first frame timestamp as reference for PTS calculation
                             self._first_video_frame_time = frame_event.timestamp_us
                             
                             # Calculate optimal bitrate if auto_bitrate is enabled
                             actual_bitrate = self._calculate_bitrate(video_width, video_height)
                             
-                            try:
-                                self._video_stream = self._output_container.add_stream(
-                                    self.video_codec,
-                                    rate=self.video_fps,
-                                )
-                                self._video_stream.width = video_width
-                                self._video_stream.height = video_height
-                                self._video_stream.pix_fmt = "yuv420p"
-                                
-                                # Build encoding options with quality settings
-                                encoding_options = self._get_video_encoding_options(actual_bitrate)
-                                self._video_stream.options = encoding_options
-                                logger.info(f"Video encoding: {video_width}x{video_height} @ {actual_bitrate/1_000_000:.2f} Mbps, quality={self.video_quality}")
-                                
-                                # CRITICAL: Allow PyAV to determine best time_base (likely 1/FPS)
-                                # We will convert to 1/1000 ONLY if the container specifically demands it during muxing
-                                # This prevents fighting the encoder's native timebase
-                                # self._video_stream.time_base = Fraction(1, 1000)
-                                
-                                if self._video_stream.time_base:
-                                    logger.info(f"Stream time_base auto-detected as: {self._video_stream.time_base}")
-                                else:
-                                    logger.warning("Stream time_base is None after add_stream. Forcing to 1/1000 for WebM compatibility.")
-                                    self._video_stream.time_base = Fraction(1, 1000)
-
-                                self._video_stream_initialized = True
-                                logger.info(
-                                    f"✅ Initialized video stream: {video_width}x{video_height}, "
-                                    f"first timestamp: {self._first_video_frame_time}us, "
-                                    f"time_base: {self._video_stream.time_base}, "
-                                    f"bitrate: {actual_bitrate/1_000_000:.2f}Mbps, "
-                                    f"codec: {self.video_codec}, fps: {self.video_fps}"
-                                )
-                            except Exception as e:
-                                logger.critical(f"❌ PyAV add_stream failed: {e}")
-                                raise
+                            self._video_stream = self._output_container.add_stream(
+                                self.video_codec,
+                                rate=self.video_fps,
+                            )
+                            self._video_stream.width = video_width
+                            self._video_stream.height = video_height
+                            self._video_stream.pix_fmt = "yuv420p"
+                            
+                            # Build encoding options with quality settings
+                            encoding_options = self._get_video_encoding_options(actual_bitrate)
+                            self._video_stream.options = encoding_options
+                            logger.info(f"Video encoding: {video_width}x{video_height} @ {actual_bitrate/1_000_000:.2f} Mbps, quality={self.video_quality}")
+                            # Set time_base for video (1/1000 for milliseconds-based timing)
+                            self._video_stream.time_base = Fraction(1, 1000)
+                            self._video_stream_initialized = True
+                            logger.info(f"Initialized video stream: {video_width}x{video_height}, first timestamp: {self._first_video_frame_time}us")
                         
                         # Encode video frame
-                        await self._encode_video_frame_incremental(frame_event, video_frame_count, capture_time)
+                        await self._encode_video_frame_incremental(frame_event, video_frame_count)
                         video_frame_count += 1
                         
                         # Release frame reference immediately after encoding
@@ -632,10 +562,9 @@ class ParticipantRecorder:
                         if self._is_recording:
                             try:
                                 logger.debug(f"Waiting for audio frame. Queue size: {self._audio_queue.qsize()}, Recording: {self._is_recording}")
-                                frame_data = await asyncio.wait_for(
+                                frame_event = await asyncio.wait_for(
                                     self._audio_queue.get(), timeout=0.1
                                 )
-                                frame_event, capture_time = frame_data
                                 frames_processed = True
                                 logger.debug(f"Received audio frame {audio_frame_count + 1}")
                             except asyncio.TimeoutError:
@@ -646,10 +575,9 @@ class ParticipantRecorder:
                             queue_size = self._audio_queue.qsize()
                             logger.debug(f"Recording stopped. Processing remaining audio frames. Queue size: {queue_size}")
                             try:
-                                frame_data = await asyncio.wait_for(
+                                frame_event = await asyncio.wait_for(
                                     self._audio_queue.get(), timeout=1.0
                                 )
-                                frame_event, capture_time = frame_data
                                 frames_processed = True
                                 logger.debug(f"Processed remaining audio frame {audio_frame_count + 1}")
                             except (asyncio.TimeoutError, asyncio.QueueEmpty):
@@ -687,7 +615,7 @@ class ParticipantRecorder:
                             logger.info(f"Initialized audio stream: {frame.sample_rate}Hz, {frame.num_channels}ch")
                         
                         # Encode audio frame
-                        await self._encode_audio_frame_incremental(frame_event, capture_time)
+                        await self._encode_audio_frame_incremental(frame_event)
                         audio_frame_count += 1
                         
                         # Release frame reference immediately after encoding
@@ -707,205 +635,44 @@ class ParticipantRecorder:
             
             # Flush encoders
             if self._video_stream:
-                flush_packet_idx = 0
                 for packet in self._video_stream.encode():
-                    logger.debug(
-                        f"Flush video packet {flush_packet_idx}: "
-                        f"pts={packet.pts}, dts={packet.dts}, "
-                        f"packet_tb={packet.time_base}, stream_tb={self._video_stream.time_base}"
-                    )
+                    if packet.dts is None:
+                        continue
+                    # Enforce monotonicity
+                    if self._last_video_dts != -1 and packet.dts <= self._last_video_dts:
+                        packet.dts = self._last_video_dts + 1
+                        if packet.pts is not None and packet.pts < packet.dts:
+                            packet.pts = packet.dts
+                    self._last_video_dts = packet.dts
                     
-                    # Enforce monotonicity for flush packets too
-                    # The encoder might emit a packet with a PTS lower than our artificially adjusted last PTS
-                    if packet.pts is not None:
-                        if packet.pts <= self._last_video_pts:
-                            old_pts = packet.pts
-                            packet.pts = self._last_video_pts + 1
-                            logger.debug(f"Flush video packet {flush_packet_idx}: Adjusted PTS {old_pts} -> {packet.pts} for monotonicity")
-                        self._last_video_pts = packet.pts
-
-                    # Force set duration if missing (CRITICAL for 0xc0000094 prevention)
-                    if not packet.duration and self.video_fps > 0:
-                        # Use packet's current timebase to calculate duration
-                        current_tb = packet.time_base or self._video_stream.time_base
-                        if current_tb and current_tb.numerator > 0:
-                            tb_val = current_tb.numerator / current_tb.denominator
-                            packet.duration = int(1 / (self.video_fps * tb_val))
-                            logger.debug(f"Flush video packet {flush_packet_idx}: Force set duration to {packet.duration} (tb={current_tb})")
-
-                    # CRITICAL FIX: Ensure packet time_base matches stream time_base before muxing
-                    # This prevents 0xc0000094 (Divide by Zero) crash in avformat
-                    target_time_base = self._video_stream.time_base or Fraction(1, 1000)
-                    if packet.time_base != target_time_base:
-                        logger.debug(
-                            f"Flush video packet {flush_packet_idx}: ⚠️ Timebase mismatch - "
-                            f"packet: {packet.time_base}, stream: {self._video_stream.time_base} (target: {target_time_base}). Checking for inflation..."
-                        )
+                    # Ensure duration > 0 to prevent 0xc0000094 crash
+                    if not packet.duration or packet.duration <= 0:
+                        packet.duration = 1
                         
-                        try:
-                            if (packet.time_base and 
-                                packet.time_base.denominator > 0 and 
-                                packet.time_base.numerator > 0 and
-                                target_time_base.denominator > 0 and
-                                target_time_base.numerator > 0):
-                                
-                                old_num = packet.time_base.numerator
-                                old_den = packet.time_base.denominator
-                                new_num = target_time_base.numerator
-                                new_den = target_time_base.denominator
-                                
-                                # Calculate rescaled PTS
-                                rescaled_pts = packet.pts
-                                if packet.pts is not None:
-                                    rescaled_pts = (packet.pts * old_num * new_den) // (old_den * new_num)
-                                
-                                # Heuristic: If rescaled PTS is significantly further from last_pts than raw PTS,
-                                # assume the encoder output raw values in target units but with wrong timebase label.
-                                use_raw = False
-                                if self._last_video_pts != -1 and packet.pts is not None:
-                                    diff_rescaled = abs(rescaled_pts - self._last_video_pts)
-                                    diff_raw = abs(packet.pts - self._last_video_pts)
-                                    # If rescaled is > 30s away and raw is < 5s away, definitely use raw
-                                    if diff_rescaled > 30000 and diff_raw < 5000:
-                                        use_raw = True
-                                        logger.warning(
-                                            f"Flush video packet {flush_packet_idx}: Detected phantom timebase! "
-                                            f"Raw PTS {packet.pts} is close to last {self._last_video_pts}, "
-                                            f"but rescaled {rescaled_pts} is huge. Using raw values."
-                                        )
-                                
-                                if use_raw:
-                                    # Trust raw values, just fix timebase
-                                    # But ensure duration is reasonable if we skip rescaling
-                                    pass
-                                else:
-                                    # Apply rescaling
-                                    if packet.pts is not None:
-                                        packet.pts = rescaled_pts
-                                    if packet.dts is not None:
-                                        packet.dts = (packet.dts * old_num * new_den) // (old_den * new_num)
-                                    if packet.duration:
-                                        packet.duration = (packet.duration * old_num * new_den) // (old_den * new_num)
-                                    
-                                packet.time_base = target_time_base
-                                # Also update stream timebase if it was None
-                                if self._video_stream.time_base is None:
-                                     self._video_stream.time_base = target_time_base
-                                     
-                                logger.debug(f"Flush video packet {flush_packet_idx}: Converted packet - pts={packet.pts}, dts={packet.dts}, dur={packet.duration}, tb={packet.time_base}")
-                            else:
-                                logger.warning(f"Flush video packet {flush_packet_idx}: Invalid timebase for manual conversion. packet_tb={packet.time_base}, target_tb={target_time_base}")
-
-                        except Exception as e:
-                            logger.error(f"Flush video packet {flush_packet_idx}: Manual conversion failed: {e}")
-                    
-                    # Ensure packet is associated with the correct stream
-                    packet.stream = self._video_stream
-                    
                     try:
                         self._output_container.mux(packet)
-                        logger.debug(f"Flush video packet {flush_packet_idx}: ✅ Mux successful")
-                    except Exception as e:
-                        logger.critical(
-                            f"Flush video packet {flush_packet_idx}: ❌ CRITICAL: Mux failed! "
-                            f"pts={packet.pts}, dts={packet.dts}, tb={packet.time_base}, error={e}"
-                        )
-                        raise
-                    flush_packet_idx += 1
-            
+                    except Exception:
+                        pass
+
             if self._audio_stream:
-                flush_audio_packet_idx = 0
                 for packet in self._audio_stream.encode():
-                    logger.debug(
-                        f"Flush audio packet {flush_audio_packet_idx}: "
-                        f"pts={packet.pts}, dts={packet.dts}, "
-                        f"packet_tb={packet.time_base}, stream_tb={self._audio_stream.time_base}"
-                    )
+                    if packet.dts is None:
+                        continue
+                    # Enforce monotonicity
+                    if self._last_audio_dts != -1 and packet.dts <= self._last_audio_dts:
+                        packet.dts = self._last_audio_dts + 1
+                        if packet.pts is not None and packet.pts < packet.dts:
+                            packet.pts = packet.dts
+                    self._last_audio_dts = packet.dts
                     
-                    # Enforce monotonicity for flush packets too
-                    if packet.pts is not None:
-                        if packet.pts <= self._last_audio_pts:
-                            packet.pts = self._last_audio_pts + 1
-                        self._last_audio_pts = packet.pts
-
-                    # Same fix for audio packets
-                    target_time_base = self._audio_stream.time_base or Fraction(1, 48000) # Default to 48k audio
-                    if packet.time_base != target_time_base:
-                        logger.debug(
-                            f"Flush audio packet {flush_audio_packet_idx}: ⚠️ Timebase mismatch - "
-                            f"packet: {packet.time_base}, stream: {self._audio_stream.time_base} (target: {target_time_base}). Checking for inflation..."
-                        )
+                    # Ensure duration > 0 to prevent crash
+                    if not packet.duration or packet.duration <= 0:
+                        packet.duration = 1
                         
-                        try:
-                            # Manual conversion for audio
-                            if (packet.time_base and 
-                                packet.time_base.denominator > 0 and 
-                                packet.time_base.numerator > 0 and
-                                target_time_base.denominator > 0 and
-                                target_time_base.numerator > 0):
-                                
-                                old_num = packet.time_base.numerator
-                                old_den = packet.time_base.denominator
-                                new_num = target_time_base.numerator
-                                new_den = target_time_base.denominator
-                                
-                                # Calculate rescaled PTS
-                                rescaled_pts = packet.pts
-                                if packet.pts is not None:
-                                    rescaled_pts = (packet.pts * old_num * new_den) // (old_den * new_num)
-                                
-                                # Heuristic for audio inflation/deflation
-                                use_raw = False
-                                if self._last_audio_pts != -1 and packet.pts is not None:
-                                    diff_rescaled = abs(rescaled_pts - self._last_audio_pts)
-                                    diff_raw = abs(packet.pts - self._last_audio_pts)
-                                    
-                                    # 30 seconds threshold in target units (approx 48000 * 30)
-                                    threshold = 30 * target_time_base.denominator // target_time_base.numerator
-                                    
-                                    if diff_rescaled > threshold and diff_raw < threshold / 6: # < 5s
-                                        use_raw = True
-                                        logger.warning(
-                                            f"Flush audio packet {flush_audio_packet_idx}: Detected phantom timebase! "
-                                            f"Raw PTS {packet.pts} is close to last {self._last_audio_pts}, "
-                                            f"but rescaled {rescaled_pts} is huge. Using raw values."
-                                        )
-
-                                if use_raw:
-                                    pass
-                                else:
-                                    if packet.pts is not None:
-                                        packet.pts = rescaled_pts
-                                    
-                                    if packet.dts is not None:
-                                        packet.dts = (packet.dts * old_num * new_den) // (old_den * new_num)
-                                        
-                                    if packet.duration:
-                                        packet.duration = (packet.duration * old_num * new_den) // (old_den * new_num)
-                                    
-                                packet.time_base = target_time_base
-                                if self._audio_stream.time_base is None:
-                                     self._audio_stream.time_base = target_time_base
-                                     
-                                logger.debug(f"Flush audio packet {flush_audio_packet_idx}: Converted packet - pts={packet.pts}, dts={packet.dts}, dur={packet.duration}, tb={packet.time_base}")
-                            else:
-                                logger.warning(f"Flush audio packet {flush_audio_packet_idx}: Invalid timebase for manual conversion. packet_tb={packet.time_base}, target_tb={target_time_base}")
-                        except Exception as e:
-                            logger.error(f"Flush audio packet {flush_audio_packet_idx}: Manual conversion failed: {e}")
-
-                    # Ensure packet is associated with the correct stream
-                    packet.stream = self._audio_stream
-
                     try:
                         self._output_container.mux(packet)
-                        logger.debug(f"Flush audio packet {flush_audio_packet_idx}: ✅ Mux successful")
-                    except Exception as e:
-                        logger.critical(
-                            f"Flush audio packet {flush_audio_packet_idx}: ❌ CRITICAL: Mux failed! "
-                            f"pts={packet.pts}, dts={packet.dts}, tb={packet.time_base}, error={e}"
-                        )
-                        raise
-                    flush_audio_packet_idx += 1
+                    except Exception:
+                        pass
             
             logger.info(f"Incremental encoding completed: {video_frame_count} video, {audio_frame_count} audio frames")
             
@@ -1045,190 +812,72 @@ class ParticipantRecorder:
         
         return options
 
-    def _encode_video_frame_incremental_sync(self, frame_event: VideoFrameEvent, frame_index: int, capture_time: float) -> None:
-        """Encode a single video frame incrementally (synchronous) with timebase fix.
-        
-        CRITICAL FIX: Ensures packet time_base matches stream time_base before muxing
-        to prevent 0xc0000094 (Divide by Zero) crash in avformat.
-        """
+    def _encode_video_frame_incremental_sync(self, frame_event: VideoFrameEvent, frame_index: int) -> None:
+        """Encode a single video frame incrementally (synchronous)."""
         if not self._video_stream or not self._output_container:
-            logger.warning(f"Frame {frame_index}: Missing stream or container - stream={self._video_stream}, container={self._output_container}")
             return
         
-        # Log stream state
-        if frame_index == 0 or frame_index % 100 == 0:
-            logger.debug(
-                f"Frame {frame_index}: Stream state - "
-                f"stream_tb={self._video_stream.time_base}, "
-                f"fps={self.video_fps}, codec={self.video_codec}"
-            )
-        
-        # Calculate PTS
-        # We calculate PTS in milliseconds (1/1000) to match the forced stream timebase.
-        # We MUST also set pyav_frame.time_base = 1/1000 so the encoder knows these are ms, not frames.
-        
-        time_base_denominator = 1000
-        time_base_numerator = 1
-        
-        stream_time_base = self._video_stream.time_base
-        if stream_time_base:
-            time_base_denominator = stream_time_base.denominator
-            time_base_numerator = stream_time_base.numerator
-            logger.debug(f"Using stream timebase for PTS calc: {stream_time_base}")
+        # Calculate PTS based on actual frame timestamps (not frame index)
+        # This ensures correct duration regardless of actual frame rate
+        if self._video_stream.time_base:
+            time_base_denominator = self._video_stream.time_base.denominator
+            time_base_numerator = self._video_stream.time_base.numerator
         else:
-            logger.warning("Stream timebase missing for PTS calc, using 1/1000")
-
-        # Use wall clock capture time for PTS to ensure sync with real-time recording
-        # capture_time is system time.time() when frame was captured
-        # start_time is system time.time() when recording started
-        if self._start_time is not None:
-            time_since_start_s = capture_time - self._start_time
-            # Ensure non-negative
-            if time_since_start_s < 0:
-                 time_since_start_s = 0
-            
-            # Calculate PTS in stream timebase units
-            # PTS = seconds * (den / num)
-            pts = int(time_since_start_s * time_base_denominator / time_base_numerator)
-            
-            # Log drift between SDK timestamp and wall clock
-            if self._first_video_frame_time is not None:
-                sdk_duration = (frame_event.timestamp_us - self._first_video_frame_time) / 1_000_000
-                drift = time_since_start_s - sdk_duration
-                if abs(drift) > 0.1:  # Log significant drift
-                    logger.debug(f"Frame {frame_index}: Time drift - Wall: {time_since_start_s:.3f}s, SDK: {sdk_duration:.3f}s, Drift: {drift:.3f}s")
-
-            # Enforce strictly monotonic increasing timestamps
-            # Handle large gaps (e.g. from stale state) by resetting
-            if self._last_video_pts != -1:
-                # If PTS jumps backwards significantly or jumps forwards massively (30s+), reset
-                # This prevents stale last_pts from inflating current timestamps
-                pts_diff = pts - self._last_video_pts
-                
-                # 30 seconds in stream timebase units
-                threshold = 30 * time_base_denominator // time_base_numerator
-                
-                if pts_diff < -threshold or pts_diff > threshold:
-                    logger.warning(f"Frame {frame_index}: Large video PTS gap detected ({self._last_video_pts} -> {pts}). Resetting monotonicity.")
-                    self._last_video_pts = pts - 1
-            
-            if pts <= self._last_video_pts:
-                 pts = self._last_video_pts + 1
-        else:
-            # Fallback if no timestamps: assume 30fps (33ms per frame)
-            # Scale to stream timebase
-            # 1 frame = 1/30 sec
-            # PTS = index * (1/30) * (den / num)
-            pts = (frame_index * time_base_denominator) // (30 * time_base_numerator)
+            time_base_denominator = 1000
+            time_base_numerator = 1
         
-        logger.debug(f"Calculated PTS: {pts} for frame {frame_index} (stream_tb={stream_time_base})")
-        self._last_video_pts = pts
+        # Use actual timestamp from frame event to calculate PTS
+        # timestamp_us is in microseconds, convert to PTS units
+        if self._first_video_frame_time is not None:
+            # Calculate time since first frame in seconds
+            time_since_first_sec = (frame_event.timestamp_us - self._first_video_frame_time) / 1_000_000.0
+            # Convert to PTS units: (time_sec * time_base_denominator) / time_base_numerator
+            # Since time_base = 1/1000, PTS = time_ms = time_sec * 1000
+            pts = int(time_since_first_sec * time_base_denominator / time_base_numerator)
+        else:
+            # Fallback to frame index if first timestamp not set (shouldn't happen)
+            frame_interval = int(time_base_denominator / (self.video_fps * time_base_numerator))
+            if frame_interval < 1:
+                frame_interval = 1
+            pts = frame_index * frame_interval
         
         # Convert and encode frame
         frame = frame_event.frame
         pyav_frame = self._convert_video_frame_to_pyav(frame, self._video_stream, pts)
-        
-        # Set time_base on the frame to match the stream
-        if pyav_frame:
-            if stream_time_base:
-                pyav_frame.time_base = stream_time_base
-            else:
-                # Force 1/1000 if stream has no timebase (it will learn from frame)
-                pyav_frame.time_base = Fraction(1, 1000)
-        
         if pyav_frame and self._video_stream:
-            # CRITICAL FIX: Ensure packet time_base matches stream time_base
-            for packet_idx, packet in enumerate(self._video_stream.encode(pyav_frame)):
-                # Log packet details before conversion
-                logger.debug(
-                    f"Frame {frame_index}, Packet {packet_idx}: "
-                    f"pts={packet.pts}, dts={packet.dts}, "
-                    f"packet_tb={packet.time_base}, stream_tb={self._video_stream.time_base}"
-                )
-                
-                # Ensure packet timebase matches stream timebase
-                target_time_base = self._video_stream.time_base or Fraction(1, 1000)
-                
-                # Capture old timebase
-                old_time_base = packet.time_base
-                
-                # Overwrite timebase to match our calculated PTS units
-                packet.time_base = target_time_base
-                packet.pts = pts
-                packet.dts = pts
-                
-                # Recalculate duration
-                if packet.duration and old_time_base and target_time_base:
-                    try:
-                        num = int(packet.duration * old_time_base.numerator * target_time_base.denominator)
-                        den = int(old_time_base.denominator * target_time_base.numerator)
-                        if den > 0:
-                            packet.duration = num // den
-                    except Exception:
-                        packet.duration = 0 
-
-                # Force set duration if missing or zero
-                if not packet.duration or packet.duration <= 0:
-                    if self.video_fps > 0:
-                        if target_time_base.numerator > 0:
-                            tb_val = target_time_base.numerator / target_time_base.denominator
-                            packet.duration = int(1 / (self.video_fps * tb_val))
-                    else:
-                        if target_time_base.denominator == 1000:
-                             packet.duration = 33
-                        else:
-                             packet.duration = 1
-                    logger.debug(f"Frame {frame_index}: Force set duration to {packet.duration} (tb={target_time_base})")
-
-                    # CRITICAL: Re-verify duration after any conversion
-                    # If duration became 0 during integer conversion (common for 1/30 -> 1/1000 conversion of small durations)
-                    # we must restore it to at least 1 tick (1ms)
-                    if not packet.duration or packet.duration <= 0:
-                        if self.video_fps > 0:
-                             packet.duration = int(1000 / self.video_fps) # e.g. 33ms for 30fps
-                        else:
-                             packet.duration = 33 # Default to 33ms
-                        logger.debug(f"Frame {frame_index}: Restored duration to {packet.duration} after conversion")
-                
-                    # Ensure packet is associated with the correct stream
-                    packet.stream = self._video_stream
-                
-                # Log before muxing
-                logger.debug(
-                    f"Frame {frame_index}, Packet {packet_idx}: Muxing packet - "
-                    f"pts={packet.pts}, dts={packet.dts}, duration={packet.duration}, tb={packet.time_base}"
-                )
-                
-                # Safety check for PTS/DTS overflow/underflow (int64 range)
-                if packet.pts is not None and (packet.pts < -9223372036854775808 or packet.pts > 9223372036854775807):
-                    logger.error(f"Frame {frame_index}: PTS out of int64 range: {packet.pts}. Dropping packet to prevent crash.")
+            for packet in self._video_stream.encode(pyav_frame):
+                # Enforce monotonicity to prevent invalid argument error
+                if packet.dts is None:
                     continue
-
+                if self._last_video_dts != -1 and packet.dts <= self._last_video_dts:
+                    packet.dts = self._last_video_dts + 1
+                    if packet.pts is not None and packet.pts < packet.dts:
+                        packet.pts = packet.dts
+                self._last_video_dts = packet.dts
+                
+                # Ensure duration > 0 to prevent 0xc0000094 crash
+                if not packet.duration or packet.duration <= 0:
+                    packet.duration = 1
+                    
                 try:
                     self._output_container.mux(packet)
-                    logger.debug(f"Frame {frame_index}, Packet {packet_idx}: ✅ Mux successful")
                 except Exception as e:
-                    logger.critical(
-                        f"Frame {frame_index}, Packet {packet_idx}: ❌ CRITICAL: Mux failed! "
-                        f"pts={packet.pts}, dts={packet.dts}, tb={packet.time_base}, error={e}"
-                    )
-                    # Don't raise, just drop the packet to keep recording alive
-                    pass
+                    logger.warning(f"Video mux failed: {e}")
         
         # Release frame reference immediately
         del pyav_frame
         
-        # Periodic GC
+        # Periodic GC (every 50 frames)
         if frame_index > 0 and frame_index % 50 == 0:
             gc.collect()
 
-    async def _encode_video_frame_incremental(self, frame_event: VideoFrameEvent, frame_index: int, capture_time: float) -> None:
+    async def _encode_video_frame_incremental(self, frame_event: VideoFrameEvent, frame_index: int) -> None:
         """Encode a single video frame incrementally."""
         # Encoding is fast enough that we can do it directly in async context
         # PyAV encode operations are typically < 10ms per frame
-        self._encode_video_frame_incremental_sync(frame_event, frame_index, capture_time)
+        self._encode_video_frame_incremental_sync(frame_event, frame_index)
 
-    def _encode_audio_frame_incremental_sync(self, frame_event: AudioFrameEvent, capture_time: float) -> None:
+    def _encode_audio_frame_incremental_sync(self, frame_event: AudioFrameEvent) -> None:
         """Encode a single audio frame incrementally (synchronous)."""
         if not self._audio_stream or not self._output_container:
             return
@@ -1237,142 +886,32 @@ class ParticipantRecorder:
         sample_rate = frame.sample_rate
         samples_per_channel = frame.samples_per_channel
         
-        # Calculate Audio PTS based on Wall Clock Time
-        # This ensures audio aligns with video and handles gaps (VFR) correctly
-        # instead of "compressing" time by assuming continuous samples.
-        
-        # Use stream timebase (likely 1/sample_rate)
-        time_base_denominator = sample_rate
-        time_base_numerator = 1
-        
-        if self._audio_stream.time_base:
-            time_base_denominator = self._audio_stream.time_base.denominator
-            time_base_numerator = self._audio_stream.time_base.numerator
-            
-        if self._start_time is not None:
-            time_since_start_s = capture_time - self._start_time
-            if time_since_start_s < 0:
-                time_since_start_s = 0
-            
-            # Calculate PTS: seconds * (den / num)
-            audio_pts = int(time_since_start_s * time_base_denominator / time_base_numerator)
-            
-            # Enforce strictly monotonic increasing timestamps for audio
-            # Audio packets must be strictly increasing to prevent muxer errors
-            
-            if self._last_audio_pts != -1:
-                # Handle large gaps (e.g. from stale state) by resetting
-                # 30 seconds in stream timebase units
-                threshold = 30 * time_base_denominator // time_base_numerator
-                pts_diff = audio_pts - self._last_audio_pts
-                
-                if pts_diff > threshold:
-                     # Allow large forward jumps (silence gap), but log it
-                     logger.warning(f"Audio PTS gap detected ({self._last_audio_pts} -> {audio_pts}). Allowing forward jump.")
-                elif pts_diff < -threshold:
-                     # Large backward jump - suspicious. But we cannot reset Muxer.
-                     # We must clamp to last_pts + 1 to maintain monotonicity.
-                     logger.warning(f"Audio PTS backward jump detected ({self._last_audio_pts} -> {audio_pts}). Clamping to monotonic.")
-                     # Do NOT reset self._last_audio_pts to a lower value, as Muxer will reject it.
-
-            if audio_pts <= self._last_audio_pts:
-                old_pts = audio_pts
-                audio_pts = self._last_audio_pts + 1
-                # Only log if the adjustment is significant (>10ms) to avoid spam on minor jitter
-                if self._last_audio_pts - old_pts > 10 * time_base_denominator / 1000:
-                     logger.debug(f"Audio PTS adjusted for monotonicity: {old_pts} -> {audio_pts} (last={self._last_audio_pts})")
-            
-            self._last_audio_pts = audio_pts
-        else:
-            # Fallback to cumulative samples if no start time (shouldn't happen)
-            audio_pts = self._cumulative_audio_samples
+        # Calculate audio PTS based on cumulative samples
+        # Use time_base of audio stream (1/sample_rate) to avoid timestamp issues
+        # PTS = cumulative_samples (since time_base is 1/sample_rate)
+        audio_pts = self._cumulative_audio_samples
         
         # Convert and encode frame
         pyav_frame = self._convert_audio_frame_to_pyav(frame, self._audio_stream, audio_pts)
         if pyav_frame and self._audio_stream:
-            for packet_idx, packet in enumerate(self._audio_stream.encode(pyav_frame)):
-                    # Fix timebase mismatch for audio packets too
-                    target_time_base = self._audio_stream.time_base or Fraction(1, 48000)
-                    if packet.time_base != target_time_base:
-                        logger.debug(
-                            f"Audio Frame, Packet {packet_idx}: ⚠️ Timebase mismatch - "
-                            f"packet: {packet.time_base}, stream: {self._audio_stream.time_base} (target: {target_time_base}). Checking for inflation..."
-                        )
-                        
-                        try:
-                            # Manual conversion for audio
-                            if (packet.time_base and 
-                                packet.time_base.denominator > 0 and 
-                                packet.time_base.numerator > 0 and
-                                target_time_base.denominator > 0 and
-                                target_time_base.numerator > 0):
-                                
-                                old_num = packet.time_base.numerator
-                                old_den = packet.time_base.denominator
-                                new_num = target_time_base.numerator
-                                new_den = target_time_base.denominator
-                                
-                                # Calculate rescaled PTS
-                                rescaled_pts = packet.pts
-                                if packet.pts is not None:
-                                    rescaled_pts = (packet.pts * old_num * new_den) // (old_den * new_num)
-                                
-                                # Heuristic for audio inflation/deflation
-                                use_raw = False
-                                if self._last_audio_pts != -1 and packet.pts is not None:
-                                    diff_rescaled = abs(rescaled_pts - self._last_audio_pts)
-                                    diff_raw = abs(packet.pts - self._last_audio_pts)
-                                    
-                                    # 30 seconds threshold in target units (approx 48000 * 30)
-                                    threshold = 30 * target_time_base.denominator // target_time_base.numerator
-                                    
-                                    if diff_rescaled > threshold and diff_raw < threshold / 6: # < 5s
-                                        use_raw = True
-                                        logger.warning(
-                                            f"Audio Frame, Packet {packet_idx}: Detected phantom timebase! "
-                                            f"Raw PTS {packet.pts} is close to last {self._last_audio_pts}, "
-                                            f"but rescaled {rescaled_pts} is huge. Using raw values."
-                                        )
+            for packet in self._audio_stream.encode(pyav_frame):
+                # Enforce monotonicity
+                if packet.dts is None:
+                    continue
+                if self._last_audio_dts != -1 and packet.dts <= self._last_audio_dts:
+                    packet.dts = self._last_audio_dts + 1
+                    if packet.pts is not None and packet.pts < packet.dts:
+                        packet.pts = packet.dts
+                self._last_audio_dts = packet.dts
 
-                                if use_raw:
-                                    pass
-                                else:
-                                    if packet.pts is not None:
-                                        packet.pts = rescaled_pts
-                                    
-                                    if packet.dts is not None:
-                                        packet.dts = (packet.dts * old_num * new_den) // (old_den * new_num)
-                                        
-                                    if packet.duration:
-                                        packet.duration = (packet.duration * old_num * new_den) // (old_den * new_num)
-                                    
-                                packet.time_base = target_time_base
-                                if self._audio_stream.time_base is None:
-                                     self._audio_stream.time_base = target_time_base
-                                     
-                                logger.debug(f"Audio Frame, Packet {packet_idx}: Converted packet - pts={packet.pts}, dts={packet.dts}, dur={packet.duration}, tb={packet.time_base}")
-                            else:
-                                logger.warning(f"Audio Frame, Packet {packet_idx}: Invalid timebase for manual conversion. packet_tb={packet.time_base}, target_tb={target_time_base}")
-                        except Exception as e:
-                            logger.error(f"Audio Frame, Packet {packet_idx}: Manual conversion failed: {e}")
-                            pass
+                # Ensure duration > 0
+                if not packet.duration or packet.duration <= 0:
+                    packet.duration = 1
 
-                    # Ensure packet is associated with the correct stream
-                    packet.stream = self._audio_stream
-                
-                    # Safety check for PTS/DTS overflow/underflow (int64 range)
-                    if packet.pts is not None and (packet.pts < -9223372036854775808 or packet.pts > 9223372036854775807):
-                        logger.error(f"Audio Frame: PTS out of int64 range: {packet.pts}. Dropping packet.")
-                        continue
-
-                    try:
-                        self._output_container.mux(packet)
-                    except Exception as e:
-                        logger.critical(
-                            f"Audio mux failed: {e} - pts={packet.pts}, dts={packet.dts}, tb={packet.time_base}"
-                        )
-                        # Don't raise, just drop the packet
-                        pass
+                try:
+                    self._output_container.mux(packet)
+                except Exception as e:
+                    logger.warning(f"Audio mux failed: {e}")
             
             # Update cumulative samples for next frame
             self._cumulative_audio_samples += samples_per_channel
@@ -1384,10 +923,10 @@ class ParticipantRecorder:
         if self._cumulative_audio_samples % (sample_rate * 4) == 0:
             gc.collect()
 
-    async def _encode_audio_frame_incremental(self, frame_event: AudioFrameEvent, capture_time: float) -> None:
+    async def _encode_audio_frame_incremental(self, frame_event: AudioFrameEvent) -> None:
         """Encode a single audio frame incrementally."""
         # Encoding is fast enough that we can do it directly in async context
-        self._encode_audio_frame_incremental_sync(frame_event, capture_time)
+        self._encode_audio_frame_incremental_sync(frame_event)
 
     async def stop_recording(self, output_path: str) -> str:
         """Stop recording and save to a WebM file.
@@ -1404,16 +943,6 @@ class ParticipantRecorder:
         async with self._lock:
             if not self._is_recording:
                 raise RecordingError("Recording is not in progress")
-
-            logger.info("Stopping recording... starting graceful drain.")
-
-            # 1. Unsubscribe FIRST to stop new data from server
-            if self._participant:
-                await self._unsubscribe_from_participant_tracks(self._participant)
-
-            # 2. Wait for buffers to drain (keep _is_recording=True during this time)
-            # This allows the capture loops to pick up the final frames
-            await asyncio.sleep(1.0)
 
             self._is_recording = False
 
@@ -1454,6 +983,12 @@ class ParticipantRecorder:
                 except asyncio.CancelledError:
                     pass
                 self._audio_capture_stream = None
+
+            # Unsubscribe from tracks to stop network activity
+            # This must be done before waiting for encoding to complete
+            # to ensure the server stops sending data immediately
+            if self._participant:
+                await self._unsubscribe_from_participant_tracks(self._participant)
 
             # Wait for encoding task to complete and flush/close
             if self._encoding_task:
@@ -1547,6 +1082,256 @@ class ParticipantRecorder:
             logger.info(f"Recording saved to {output_file}")
             return output_file
 
+    async def _encode_to_webm(self, output_path: str) -> str:
+        """Encode captured frames to a WebM file incrementally.
+        
+        This method processes frames as they're dequeued rather than collecting
+        all frames first, significantly reducing memory usage for long recordings.
+        """
+        output_file = Path(output_path).resolve()
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Check if we have any frames to encode
+        if self._video_queue.empty() and self._audio_queue.empty():
+            logger.warning(
+                "No frames captured during recording. Creating empty file will be skipped."
+            )
+            # Create an empty file but mark it as such
+            output_file.touch()
+            return str(output_file)
+
+        # Process frames incrementally - collect them in small batches and sort
+        # This allows us to process frames in order while limiting memory usage
+        # We'll collect frames in batches, sort each batch, then encode incrementally
+        video_frames_batch: list[VideoFrameEvent] = []
+        audio_frames_batch: list[AudioFrameEvent] = []
+        
+        # Collect remaining frames from queues (queues are bounded so this is limited)
+        while True:
+            try:
+                frame_event = self._video_queue.get_nowait()
+                video_frames_batch.append(frame_event)
+            except asyncio.QueueEmpty:
+                break
+
+        while True:
+            try:
+                frame_event = self._audio_queue.get_nowait()
+                audio_frames_batch.append(frame_event)
+            except asyncio.QueueEmpty:
+                break
+
+        # Sort frames by timestamp to ensure proper synchronization order
+        # Since queues are bounded (max ~5 seconds of frames), sorting is still efficient
+        video_frames_batch.sort(key=lambda e: e.timestamp_us)
+        # Audio frames don't have timestamps, but we'll process them in order
+
+        # Run encoding in a thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        absolute_path = await loop.run_in_executor(
+            None,
+            self._encode_to_webm_sync,
+            str(output_file),
+            video_frames_batch,
+            audio_frames_batch,
+        )
+
+        # Clear frames from memory after encoding to prevent memory leaks
+        del video_frames_batch
+        del audio_frames_batch
+
+        # Get file size
+        output_file_obj = Path(absolute_path)
+        if output_file_obj.exists():
+            self._stats.output_file_size_bytes = output_file_obj.stat().st_size
+
+        return absolute_path
+
+    def _encode_to_webm_sync(
+        self,
+        output_path: str,
+        video_frames: list[VideoFrameEvent],
+        audio_frames: list[AudioFrameEvent],
+    ) -> str:
+        """Synchronously encode frames to WebM (runs in executor)."""
+        logger.info(f"Starting WebM encoding: {len(video_frames)} video frames, {len(audio_frames)} audio frames")
+        # Create output container
+        output_container = av.open(output_path, mode="w", format="webm")
+
+        try:
+            video_stream: Optional[av.VideoStream] = None
+            audio_stream: Optional[av.AudioStream] = None
+
+            # Determine video properties from first frame
+            if video_frames:
+                first_video_frame = video_frames[0].frame
+                video_width = first_video_frame.width
+                video_height = first_video_frame.height
+
+                # Add video stream
+                video_stream = output_container.add_stream(
+                    self.video_codec,
+                    rate=self.video_fps,
+                )
+                video_stream.width = video_width
+                video_stream.height = video_height
+                video_stream.pix_fmt = "yuv420p"
+                # Calculate optimal bitrate if auto_bitrate is enabled
+                actual_bitrate = self._calculate_bitrate(video_width, video_height)
+                # Build encoding options with quality settings
+                video_stream.options = self._get_video_encoding_options(actual_bitrate)
+
+            # Add audio stream
+            if audio_frames:
+                first_audio_frame = audio_frames[0].frame
+                audio_stream = output_container.add_stream(self.audio_codec)
+                audio_stream.rate = first_audio_frame.sample_rate
+                # Set layout (channels is read-only on stream and codec_context)
+                # Determine layout string based on number of channels
+                if first_audio_frame.num_channels == 1:
+                    layout_str = "mono"
+                elif first_audio_frame.num_channels == 2:
+                    layout_str = "stereo"
+                else:
+                    layout_str = f"{first_audio_frame.num_channels}"
+                audio_stream.codec_context.layout = layout_str
+                audio_stream.options = {"bitrate": str(self.audio_bitrate)}
+
+            # Encode video frames using frame-based PTS calculation
+            # Calculate spacing based on actual recording duration to ensure correct playback speed
+            if video_stream:
+                total_video_frames = len(video_frames)
+                logger.debug(f"Encoding {total_video_frames} video frames...")
+                
+                # Calculate frame interval in time_base units
+                if video_stream.time_base:
+                    time_base_denominator = video_stream.time_base.denominator
+                    time_base_numerator = video_stream.time_base.numerator
+                else:
+                    time_base_denominator = 1000
+                    time_base_numerator = 1
+                
+                # Calculate actual frame rate from recording duration
+                # This ensures video plays at correct speed over the full duration
+                recording_duration_sec = self._stats.recording_duration_seconds
+                if recording_duration_sec > 0 and total_video_frames > 0:
+                    # Calculate actual frame rate from captured frames
+                    actual_fps = total_video_frames / recording_duration_sec
+                    logger.debug(f"Recording duration: {recording_duration_sec:.2f}s, frames: {total_video_frames}, actual FPS: {actual_fps:.2f}")
+                else:
+                    # Fallback to target FPS
+                    actual_fps = self.video_fps
+                
+                # Calculate frame interval based on actual frame rate
+                # This ensures frames are evenly spaced over the recording duration
+                # frame_interval = time_base_denominator / (actual_fps * time_base_numerator)
+                frame_interval = int(time_base_denominator / (actual_fps * time_base_numerator))
+                if frame_interval < 1:
+                    frame_interval = 1
+                
+                logger.debug(f"Frame interval: {frame_interval} PTS units ({frame_interval/1000:.3f} ms per frame at {actual_fps:.2f} fps)")
+                
+                # Calculate PTS for each frame based on frame index
+                # This ensures frames are spaced correctly at the target frame rate
+                for idx, frame_event in enumerate(video_frames):
+                    if idx > 0 and idx % 100 == 0:
+                        logger.debug(f"Encoding video frame {idx}/{len(video_frames)}...")
+                    frame = frame_event.frame
+                    
+                    # Calculate PTS based on frame index
+                    # PTS = frame_index * frame_interval
+                    # Frame 0: PTS = 0 (starts immediately)
+                    # Frame 1: PTS = frame_interval (~33ms at 30fps)
+                    # Frame 30: PTS = 30 * frame_interval (~1 second at 30fps)
+                    pts = idx * frame_interval
+                    
+                    # Convert VideoFrame to PyAV frame
+                    pyav_frame = self._convert_video_frame_to_pyav(
+                        frame, video_stream, pts
+                    )
+                    if pyav_frame and video_stream:
+                        for packet in video_stream.encode(pyav_frame):
+                            output_container.mux(packet)
+                    
+                    # Explicitly release frame references to help GC
+                    # This is critical for memory efficiency as frames can be large (~3-4MB each)
+                    del pyav_frame
+                    # Also release the frame reference from the event
+                    # This helps Python GC free the underlying frame data sooner
+                    frame_event.frame = None  # type: ignore
+                    
+                    # Trigger GC periodically to free memory (every 50 frames)
+                    # This helps prevent memory accumulation during encoding
+                    if idx > 0 and idx % 50 == 0:
+                        gc.collect()
+
+            # Flush video encoder
+            if video_stream:
+                for packet in video_stream.encode():
+                    output_container.mux(packet)
+
+            # Encode audio frames synchronized with video timestamps
+            # Calculate audio PTS based on cumulative samples, aligned with video timing
+            # Use the same time_base as video (1/1000 milliseconds) for consistency
+            if audio_stream:
+                sample_rate = audio_frames[0].frame.sample_rate if audio_frames else 48000
+                
+                # Calculate audio PTS in milliseconds (same time_base as video: 1/1000)
+                # Audio PTS should match the video timing based on sample count
+                cumulative_samples = 0
+                
+                for frame_event in audio_frames:
+                    frame = frame_event.frame
+                    samples_per_channel = frame.samples_per_channel
+                    
+                    # Calculate PTS in milliseconds based on cumulative samples
+                    # This naturally aligns with video timing since both start from 0
+                    # PTS_ms = (cumulative_samples / sample_rate) * 1000
+                    audio_pts_ms = int((cumulative_samples / sample_rate) * 1000)
+                    
+                    # Convert AudioFrame to PyAV frame
+                    pyav_frame = self._convert_audio_frame_to_pyav(
+                        frame, audio_stream, audio_pts_ms
+                    )
+                    if pyav_frame and audio_stream:
+                        for packet in audio_stream.encode(pyav_frame):
+                            output_container.mux(packet)
+                        # Increment by samples per channel for next frame
+                        cumulative_samples += samples_per_channel
+                    
+                    # Explicitly release frame references to help GC
+                    del pyav_frame
+                    # Release the frame reference from the event to help GC free audio data
+                    frame_event.frame = None  # type: ignore
+                    
+                    # Trigger GC periodically (every 200 audio frames since they're smaller)
+                    if cumulative_samples % (sample_rate * 4) == 0:  # Every ~4 seconds of audio
+                        gc.collect()
+
+            # Flush audio encoder
+            if audio_stream:
+                for packet in audio_stream.encode():
+                    output_container.mux(packet)
+
+        finally:
+            output_container.close()
+            # Explicitly release all frame references to help GC
+            # This is critical for memory efficiency - frames can be several MB each
+            for frame_event in video_frames:
+                if hasattr(frame_event, 'frame'):
+                    frame_event.frame = None  # type: ignore
+            for frame_event in audio_frames:
+                if hasattr(frame_event, 'frame'):
+                    frame_event.frame = None  # type: ignore
+            video_frames.clear()
+            audio_frames.clear()
+            
+            # Force garbage collection after encoding to free memory
+            # This is important because frames can be large and GC might not run immediately
+            gc.collect()
+
+        return output_path
+
     def _convert_video_frame_to_pyav(
         self,
         frame: VideoFrame,
@@ -1559,11 +1344,6 @@ class ParticipantRecorder:
         should be released after encoding (handled in calling code).
         """
         if not stream:
-            return None
-
-        # Validate inputs before PyAV call
-        if frame.width <= 0 or frame.height <= 0:
-            logger.error(f"❌ Invalid frame dimensions: {frame.width}x{frame.height}")
             return None
 
         try:
@@ -1650,10 +1430,7 @@ class ParticipantRecorder:
                     pyav_frame.time_base = stream.time_base
                 except (AttributeError, ValueError, TypeError) as e:
                     logger.warning(f"Could not set time_base: {e}")
-            else:
-                # Fallback: If stream has no timebase (yet), assume 1/1000 because
-                # that's what we use for PTS calculation in _encode_video_frame_incremental_sync
-                pyav_frame.time_base = Fraction(1, 1000)
+                    # Continue without time_base - PyAV may infer it
 
             # Release converted frame reference if we created one
             # This helps GC free the conversion buffer sooner
@@ -1662,11 +1439,8 @@ class ParticipantRecorder:
             
             return pyav_frame
         except Exception as e:
-            logger.critical(
-                f"❌ Frame allocation failed: {frame.width}x{frame.height}, "
-                f"PTS: {pts}, Error: {e}"
-            )
-            raise
+            logger.error(f"Error converting video frame: {e}", exc_info=True)
+            return None
 
     def _convert_audio_frame_to_pyav(
         self,
@@ -1731,17 +1505,7 @@ class ParticipantRecorder:
             output_file_size_bytes=self._stats.output_file_size_bytes,
         )
 
-    def debug_get_internal_state(self):
-        return {
-            "video_queue_size": self._video_queue.qsize(),
-            "audio_queue_size": self._audio_queue.qsize(),
-            "video_stream_init": self._video_stream_initialized,
-            "frames_processed": self._stats.video_frames_recorded,
-            "last_pts": getattr(self, '_last_processed_pts', None)
-        }
-
     @property
     def is_recording(self) -> bool:
         """Check if recording is currently in progress."""
         return self._is_recording
-
